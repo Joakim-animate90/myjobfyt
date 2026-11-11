@@ -75,7 +75,7 @@ type fakeAccountant struct {
 	mu         sync.Mutex
 	reserveErr error
 	reserved   []int64
-	recorded   []ai.Usage
+	recorded   []int64
 	purposes   []string
 }
 
@@ -89,21 +89,20 @@ func (f *fakeAccountant) Reserve(_ context.Context, tokens int64) error {
 	return nil
 }
 
-func (f *fakeAccountant) Record(_ context.Context, purpose string, usage ai.Usage) error {
+func (f *fakeAccountant) Record(_ context.Context, purpose string, totalTokens int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.purposes = append(f.purposes, purpose)
-	f.recorded = append(f.recorded, usage)
+	f.recorded = append(f.recorded, totalTokens)
 	return nil
 }
 
-func (f *fakeAccountant) totalRecorded() ai.Usage {
+func (f *fakeAccountant) totalRecorded() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var total ai.Usage
-	for _, u := range f.recorded {
-		total.InputTokens += u.InputTokens
-		total.OutputTokens += u.OutputTokens
+	var total int64
+	for _, n := range f.recorded {
+		total += n
 	}
 	return total
 }
@@ -252,8 +251,8 @@ func TestTokensFromFailedAttemptsAreStillCounted(t *testing.T) {
 	if resp.Usage.TotalTokens() != 3300 {
 		t.Fatalf("accumulated tokens = %d, want 3300 across all three attempts", resp.Usage.TotalTokens())
 	}
-	if recorded := accountant.totalRecorded(); recorded.TotalTokens() != 3300 {
-		t.Fatalf("recorded tokens = %d, want 3300", recorded.TotalTokens())
+	if recorded := accountant.totalRecorded(); recorded != 3300 {
+		t.Fatalf("recorded tokens = %d, want 3300", recorded)
 	}
 }
 
@@ -390,7 +389,7 @@ func TestAccountingFailureDoesNotFailTheCall(t *testing.T) {
 type failingRecordAccountant struct{}
 
 func (failingRecordAccountant) Reserve(context.Context, int64) error { return nil }
-func (failingRecordAccountant) Record(context.Context, string, ai.Usage) error {
+func (failingRecordAccountant) Record(context.Context, string, int64) error {
 	return errors.New("counter unavailable")
 }
 

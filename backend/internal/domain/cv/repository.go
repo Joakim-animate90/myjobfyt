@@ -2,6 +2,7 @@ package cv
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/apperr"
@@ -29,6 +30,13 @@ type Repository interface {
 	StoreExtractedText(ctx context.Context, versionID uuid.UUID, text ExtractedText) error
 	MarkParseFailed(ctx context.Context, versionID uuid.UUID, reason ParseFailureReason, stage string) error
 	MarkParsed(ctx context.Context, versionID uuid.UUID, at time.Time) error
+
+	RawText(ctx context.Context, versionID uuid.UUID) (string, error)
+	StoreParsedData(ctx context.Context, parsed *ParsedData, skills []Skill) error
+	StoreCandidateEdit(ctx context.Context, parsed *ParsedData, changedFields []string) error
+	ParsedDataByVersion(ctx context.Context, userID, versionID uuid.UUID) (*ParsedData, error)
+	SkillsByVersion(ctx context.Context, userID, versionID uuid.UUID) ([]Skill, error)
+	RecordCorrection(ctx context.Context, userID, versionID uuid.UUID, field string) error
 
 	SetLabel(ctx context.Context, userID, documentID uuid.UUID, label string) error
 	SetDefault(ctx context.Context, userID, documentID uuid.UUID) error
@@ -523,4 +531,350 @@ func (r *PostgresRepository) VersionIsReferenced(ctx context.Context, documentID
 		return false, apperr.Internalf(err, "check cv references")
 	}
 	return referenced, nil
+}
+
+// --- parsed data ------------------------------------------------------------
+
+// StoreCandidateEdit persists a candidate's own edit of their parsed CV.
+//
+// Distinct from StoreParsedData, and the distinction is the whole point. A machine
+// re-parse must PRESERVE corrections; a candidate edit must APPLY them. Running an edit
+// through the preserving path would read the stored value, decide it was corrected, and
+// write it back — silently discarding the change the candidate just made.
+//
+// changedFields are added to the correction list, so every later re-parse respects them.
+func (r *PostgresRepository) StoreCandidateEdit(ctx context.Context, parsed *ParsedData, changedFields []string) error {
+	return r.db.InTx(ctx, func(ctx context.Context) error {
+		existing, err := r.parsedDataForUpdate(ctx, parsed.CVVersionID)
+		if err != nil {
+			return err
+		}
+		if existing == nil {
+			return apperr.NotFound("parsed CV data")
+		}
+
+		// Values are taken as given — no merge. The correction list is the union of
+		// what was already corrected and what this edit touched.
+		parsed.CorrectedFields = unionFields(existing.CorrectedFields, changedFields)
+
+		return r.writeParsedData(ctx, parsed)
+	})
+}
+
+// unionFields merges two field lists, preserving order and dropping duplicates and
+// blanks.
+func unionFields(existing, added []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(added))
+	out := make([]string, 0, len(existing)+len(added))
+
+	for _, list := range [][]string{existing, added} {
+		for _, f := range list {
+			if f == "" {
+				continue
+			}
+			if _, dup := seen[f]; dup {
+				continue
+			}
+			seen[f] = struct{}{}
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// StoreParsedData persists an extraction, preserving any candidate corrections.
+//
+// The read and the write happen in one transaction: without it, a candidate correcting
+// a field while a re-parse is in flight could have their edit read as absent and then
+// overwritten. SERIALIZABLE is not needed — the version id is the only key and
+// concurrent writes to the same version are already serialised by the row lock the
+// SELECT FOR UPDATE takes.
+func (r *PostgresRepository) StoreParsedData(ctx context.Context, parsed *ParsedData, skills []Skill) error {
+	return r.db.InTx(ctx, func(ctx context.Context) error {
+		existing, err := r.parsedDataForUpdate(ctx, parsed.CVVersionID)
+		if err != nil {
+			return err
+		}
+
+		merged := MergePreservingCorrections(parsed, existing)
+
+		if err := r.writeParsedData(ctx, merged); err != nil {
+			return err
+		}
+
+		// Skills live in their own table and are replaced wholesale, unless the
+		// candidate has edited them — in which case the stored rows are theirs.
+		if SkillsAreCorrected(existing) {
+			return nil
+		}
+		return r.replaceSkills(ctx, merged.CVVersionID, merged.UserID, skills)
+	})
+}
+
+// writeParsedData upserts a parsed-data row. Shared by the re-parse and candidate-edit
+// paths so there is exactly one copy of the column list.
+func (r *PostgresRepository) writeParsedData(ctx context.Context, merged *ParsedData) error {
+	{
+		contact, err := merged.MarshalContact()
+		if err != nil {
+			return apperr.Internalf(err, "marshal contact")
+		}
+		experience, err := merged.MarshalExperience()
+		if err != nil {
+			return apperr.Internalf(err, "marshal experience")
+		}
+		education, err := merged.MarshalEducation()
+		if err != nil {
+			return apperr.Internalf(err, "marshal education")
+		}
+		certifications, err := merged.MarshalCertifications()
+		if err != nil {
+			return apperr.Internalf(err, "marshal certifications")
+		}
+		languages, err := merged.MarshalLanguages()
+		if err != nil {
+			return apperr.Internalf(err, "marshal languages")
+		}
+		provenance, err := merged.MarshalProvenance()
+		if err != nil {
+			return apperr.Internalf(err, "marshal provenance")
+		}
+
+		const upsert = `
+			INSERT INTO cv_parsed_data (
+				cv_version_id, user_id, summary, contact, experience, education,
+				certifications, languages, confidence, corrected_fields,
+				total_experience_months, detected_seniority, engine_version
+			) VALUES ($1, $2, nullif($3, ''), $4, $5, $6, $7, $8, $9, $10, $11, nullif($12, ''), $13)
+			ON CONFLICT (cv_version_id) DO UPDATE SET
+				summary                 = EXCLUDED.summary,
+				contact                 = EXCLUDED.contact,
+				experience              = EXCLUDED.experience,
+				education               = EXCLUDED.education,
+				certifications          = EXCLUDED.certifications,
+				languages               = EXCLUDED.languages,
+				confidence              = EXCLUDED.confidence,
+				corrected_fields        = EXCLUDED.corrected_fields,
+				total_experience_months = EXCLUDED.total_experience_months,
+				detected_seniority      = EXCLUDED.detected_seniority,
+				engine_version          = EXCLUDED.engine_version
+			RETURNING created_at, updated_at`
+
+		err = r.db.Querier(ctx).QueryRow(ctx, upsert,
+			merged.CVVersionID, merged.UserID, merged.Summary, contact, experience,
+			education, certifications, languages, provenance, merged.CorrectedFields,
+			merged.TotalExperienceMonths, merged.DetectedSeniority, merged.EngineVersion,
+		).Scan(&merged.CreatedAt, &merged.UpdatedAt)
+		if err != nil {
+			if postgres.IsForeignKeyViolation(err) {
+				// The version was deleted while this extraction was in flight.
+				return apperr.NotFound("CV version")
+			}
+			return apperr.Internalf(err, "upsert parsed cv data")
+		}
+		return nil
+	}
+}
+
+// parsedDataForUpdate loads the existing record and locks the row, returning nil when
+// there is none.
+//
+// Only the fields the merge needs are selected. Loading the provenance report as well
+// would pull a large jsonb blob that is about to be replaced.
+func (r *PostgresRepository) parsedDataForUpdate(ctx context.Context, versionID uuid.UUID) (*ParsedData, error) {
+	const q = `
+		SELECT coalesce(summary, ''), contact, experience, education, certifications,
+		       languages, corrected_fields, total_experience_months,
+		       coalesce(detected_seniority, '')
+		FROM cv_parsed_data
+		WHERE cv_version_id = $1
+		FOR UPDATE`
+
+	var (
+		existing                                                  ParsedData
+		contact, experience, education, certifications, languages []byte
+	)
+	err := r.db.Querier(ctx).QueryRow(ctx, q, versionID).Scan(
+		&existing.Summary, &contact, &experience, &education, &certifications,
+		&languages, &existing.CorrectedFields, &existing.TotalExperienceMonths,
+		&existing.DetectedSeniority,
+	)
+	if err != nil {
+		if postgres.IsNoRows(err) {
+			return nil, nil
+		}
+		return nil, apperr.Internalf(err, "select existing parsed cv data")
+	}
+
+	// Only unmarshal what a correction could preserve. A malformed stored blob is
+	// treated as absent rather than failing the write: the alternative is a CV that can
+	// never be re-parsed because of a bad row written by an older version of this code.
+	_ = json.Unmarshal(contact, &existing.Contact)
+	_ = json.Unmarshal(experience, &existing.Experience)
+	_ = json.Unmarshal(education, &existing.Education)
+	_ = json.Unmarshal(certifications, &existing.Certifications)
+	_ = json.Unmarshal(languages, &existing.Languages)
+
+	existing.CVVersionID = versionID
+	return &existing, nil
+}
+
+// replaceSkills swaps a version's skill rows for a new set.
+//
+// Delete-then-insert rather than a diff: the set is small, it runs inside the caller's
+// transaction, and a diff would have to decide what "the same skill" means across
+// re-parses — which is exactly the ambiguity that makes list-item correction merging
+// unsafe.
+func (r *PostgresRepository) replaceSkills(ctx context.Context, versionID, userID uuid.UUID, skills []Skill) error {
+	const clear = `DELETE FROM cv_skills WHERE cv_version_id = $1`
+	if _, err := r.db.Querier(ctx).Exec(ctx, clear, versionID); err != nil {
+		return apperr.Internalf(err, "clear cv skills")
+	}
+	if len(skills) == 0 {
+		return nil
+	}
+
+	// ON CONFLICT DO NOTHING rather than catching the unique violation in Go.
+	//
+	// Inside a transaction a failed statement aborts the whole transaction: Postgres
+	// rejects every subsequent statement and the commit fails with "commit
+	// unexpectedly resulted in rollback". Catching the error and continuing looks like
+	// it works and does not — the conflict has to be handled by the statement itself.
+	const insert = `
+		INSERT INTO cv_skills (cv_version_id, user_id, skill_id, raw_label, years, confidence, source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (cv_version_id, raw_label) DO NOTHING`
+
+	for _, skill := range skills {
+		source := skill.Source
+		if source == "" {
+			source = SkillSourceAI
+		}
+		_, err := r.db.Querier(ctx).Exec(ctx, insert,
+			versionID, userID, skill.SkillID, skill.RawLabel,
+			skill.Years, skill.Confidence, string(source))
+		if err != nil {
+			return apperr.Internalf(err, "insert cv skill %q", skill.RawLabel)
+		}
+	}
+	return nil
+}
+
+// ParsedDataByVersion loads a version's parsed data, scoped to its owner.
+func (r *PostgresRepository) ParsedDataByVersion(ctx context.Context, userID, versionID uuid.UUID) (*ParsedData, error) {
+	const q = `
+		SELECT cv_version_id, user_id, coalesce(summary, ''), contact, experience,
+		       education, certifications, languages, confidence, corrected_fields,
+		       total_experience_months, coalesce(detected_seniority, ''),
+		       coalesce(engine_version, ''), created_at, updated_at
+		FROM cv_parsed_data
+		WHERE cv_version_id = $1 AND user_id = $2`
+
+	var (
+		parsed                                                                ParsedData
+		contact, experience, education, certifications, languages, provenance []byte
+	)
+	err := r.db.Querier(ctx).QueryRow(ctx, q, versionID, userID).Scan(
+		&parsed.CVVersionID, &parsed.UserID, &parsed.Summary, &contact, &experience,
+		&education, &certifications, &languages, &provenance, &parsed.CorrectedFields,
+		&parsed.TotalExperienceMonths, &parsed.DetectedSeniority,
+		&parsed.EngineVersion, &parsed.CreatedAt, &parsed.UpdatedAt,
+	)
+	if err != nil {
+		if postgres.IsNoRows(err) {
+			return nil, apperr.NotFound("parsed CV data")
+		}
+		return nil, apperr.Internalf(err, "select parsed cv data")
+	}
+
+	if err := json.Unmarshal(contact, &parsed.Contact); err != nil {
+		return nil, apperr.Internalf(err, "parse stored contact")
+	}
+	if err := json.Unmarshal(experience, &parsed.Experience); err != nil {
+		return nil, apperr.Internalf(err, "parse stored experience")
+	}
+	if err := json.Unmarshal(education, &parsed.Education); err != nil {
+		return nil, apperr.Internalf(err, "parse stored education")
+	}
+	if err := json.Unmarshal(certifications, &parsed.Certifications); err != nil {
+		return nil, apperr.Internalf(err, "parse stored certifications")
+	}
+	if err := json.Unmarshal(languages, &parsed.Languages); err != nil {
+		return nil, apperr.Internalf(err, "parse stored languages")
+	}
+	// Provenance is advisory for the UI, so a malformed blob degrades the review screen
+	// rather than failing the read of otherwise-good CV data.
+	_ = json.Unmarshal(provenance, &parsed.Provenance)
+
+	return &parsed, nil
+}
+
+// SkillsByVersion loads a version's skills, scoped to its owner.
+func (r *PostgresRepository) SkillsByVersion(ctx context.Context, userID, versionID uuid.UUID) ([]Skill, error) {
+	const q = `
+		SELECT skill_id, raw_label, years, confidence, source
+		FROM cv_skills
+		WHERE cv_version_id = $1 AND user_id = $2
+		ORDER BY confidence DESC NULLS LAST, raw_label`
+
+	rows, err := r.db.Querier(ctx).Query(ctx, q, versionID, userID)
+	if err != nil {
+		return nil, apperr.Internalf(err, "list cv skills")
+	}
+	defer rows.Close()
+
+	var out []Skill
+	for rows.Next() {
+		var skill Skill
+		if err := rows.Scan(&skill.SkillID, &skill.RawLabel, &skill.Years,
+			&skill.Confidence, &skill.Source); err != nil {
+			return nil, apperr.Internalf(err, "scan cv skill")
+		}
+		out = append(out, skill)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internalf(err, "iterate cv skills")
+	}
+	return out, nil
+}
+
+// RecordCorrection marks a field as candidate-owned.
+//
+// Appends rather than replaces, and is idempotent, so a candidate editing the same
+// field twice does not accumulate duplicates.
+func (r *PostgresRepository) RecordCorrection(ctx context.Context, userID, versionID uuid.UUID, field string) error {
+	const q = `
+		UPDATE cv_parsed_data
+		SET corrected_fields = (
+			SELECT array_agg(DISTINCT f)
+			FROM unnest(corrected_fields || ARRAY[$3]::text[]) AS f
+		)
+		WHERE cv_version_id = $1 AND user_id = $2`
+
+	tag, err := r.db.Querier(ctx).Exec(ctx, q, versionID, userID, field)
+	if err != nil {
+		return apperr.Internalf(err, "record cv correction")
+	}
+	if tag.RowsAffected() == 0 {
+		return apperr.NotFound("parsed CV data")
+	}
+	return nil
+}
+
+// RawText loads a version's extracted text for the structure stage.
+//
+// Not user-scoped: this runs in a worker holding only a version id from an event
+// envelope, and that id is an unguessable UUID. Every candidate-facing read path is
+// scoped.
+func (r *PostgresRepository) RawText(ctx context.Context, versionID uuid.UUID) (string, error) {
+	const q = `SELECT coalesce(raw_text, '') FROM cv_versions WHERE id = $1`
+
+	var text string
+	if err := r.db.Querier(ctx).QueryRow(ctx, q, versionID).Scan(&text); err != nil {
+		if postgres.IsNoRows(err) {
+			return "", apperr.NotFound("CV version")
+		}
+		return "", apperr.Internalf(err, "select cv raw text")
+	}
+	return text, nil
 }

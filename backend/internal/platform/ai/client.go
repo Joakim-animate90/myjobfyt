@@ -162,7 +162,7 @@ func (c *Client) record(ctx context.Context, req Request, usage Usage, attempts 
 	if c.accountant == nil {
 		return
 	}
-	if err := c.accountant.Record(ctx, string(req.Purpose), usage); err != nil {
+	if err := c.accountant.Record(ctx, string(req.Purpose), usage.TotalTokens()); err != nil {
 		c.log.ErrorContext(ctx, "ai token usage was not recorded",
 			slog.String("purpose", string(req.Purpose)), slog.Any("error", err))
 	}

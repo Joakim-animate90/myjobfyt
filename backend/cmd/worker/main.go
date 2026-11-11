@@ -19,10 +19,13 @@ import (
 
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/config"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/cv"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/entitlements"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/ai"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/antivirus"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/docextract"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/events"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/postgres"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/redisx"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/storage"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/telemetry"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/worker"
@@ -78,19 +81,32 @@ func run() error {
 		return err
 	}
 
+	extractor, err := buildExtractor(ctx, cfg, db, log)
+	if err != nil {
+		return err
+	}
+
 	log.Info("dependencies ready",
 		slog.String("scanner", scanner.Name()),
 		slog.String("bucket", cfg.Storage.Bucket),
+		slog.Bool("structured_extraction", extractor != nil),
 	)
+	if extractor == nil {
+		// Said out loud, because the symptom otherwise is CVs that parse successfully
+		// and produce no matchable data, which looks like a matching bug.
+		log.Warn("structured CV extraction is DISABLED (AI_ENABLED=false); " +
+			"CVs will be marked parsed on extracted text alone and will not be matchable")
+	}
 
 	// --- consumers ----------------------------------------------------------
 
 	cvWorker := cv.NewWorker(cv.WorkerDeps{
-		Repo:    cv.NewPostgresRepository(db),
-		Store:   objectStore,
-		Scanner: scanner,
-		Bus:     bus,
-		Logger:  log,
+		Repo:      cv.NewPostgresRepository(db),
+		Store:     objectStore,
+		Scanner:   scanner,
+		Extractor: extractor,
+		Bus:       bus,
+		Logger:    log,
 		Limits: docextract.Limits{
 			MaxPages: cfg.Extract.MaxPages,
 			MaxChars: cfg.Extract.MaxChars,
@@ -176,6 +192,62 @@ func buildScanner(ctx context.Context, cfg *config.Config, log *slog.Logger) (cv
 	}
 
 	return scanner, nil
+}
+
+// buildExtractor constructs the structured-extraction adapter, or nil when AI is
+// disabled.
+//
+// Returning nil rather than erroring is deliberate: the pipeline runs end to end
+// without a provider, which keeps the platform usable with no API key and no spend.
+// Production validation makes that impossible there, because a CV that never becomes
+// matchable means the product does not work.
+func buildExtractor(ctx context.Context, cfg *config.Config, db *postgres.DB, log *slog.Logger) (cv.Extractor, error) {
+	if !cfg.AI.Enabled {
+		if cfg.Env.IsProduction() {
+			return nil, errors.New("AI_ENABLED must be true")
+		}
+		return nil, nil
+	}
+
+	provider := ai.NewAnthropicProvider(ai.AnthropicConfig{
+		APIKey:     cfg.AI.APIKey,
+		BaseURL:    cfg.AI.BaseURL,
+		MaxRetries: cfg.AI.MaxRetries,
+	})
+
+	// Reachability is checked at boot rather than on the first CV. A worker that starts
+	// healthy and then fails every extraction is much harder to diagnose than one that
+	// refuses to start, and the check costs a single token.
+	pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := provider.Ping(pingCtx); err != nil {
+		return nil, fmt.Errorf("ai provider is not reachable: %w", err)
+	}
+
+	redis, err := redisx.Open(ctx, cfg.Redis)
+	if err != nil {
+		return nil, fmt.Errorf("redis (needed for AI token quotas): %w", err)
+	}
+
+	accountant := entitlements.NewTokenAccountant(
+		entitlements.NewService(entitlements.NewPostgresRepository(db), redis, log, nil),
+		log,
+	)
+
+	client := ai.NewClient(ai.ClientDeps{
+		Provider:   provider,
+		Accountant: accountant,
+		Logger:     log,
+	})
+
+	log.Info("structured CV extraction enabled",
+		slog.String("provider", provider.Name()),
+		slog.Int64("per_call_token_budget", cfg.AI.ExtractionTokenBudget),
+	)
+
+	return cv.NewAIExtractor(client, cv.ExtractorConfig{
+		PerCallTokenBudget: cfg.AI.ExtractionTokenBudget,
+	}), nil
 }
 
 // startMetricsServer exposes Prometheus metrics and a liveness endpoint.

@@ -500,3 +500,68 @@ func (r *PostgresRepository) CountLevel(ctx context.Context, userID uuid.UUID, q
 	}
 	return n, nil
 }
+
+// --- AI token accounting ----------------------------------------------------
+
+// TokenAccountant adapts the entitlements service to the AI layer's accounting
+// interface.
+type TokenAccountant struct {
+	svc *Service
+	log *slog.Logger
+	// userID is resolved per call from the request context, so one accountant serves
+	// every candidate rather than needing one per request.
+	resolveUser func(ctx context.Context) (uuid.UUID, bool)
+}
+
+// NewTokenAccountant builds the adapter.
+func NewTokenAccountant(svc *Service, log *slog.Logger) *TokenAccountant {
+	return &TokenAccountant{svc: svc, log: log, resolveUser: userFromContext}
+}
+
+// Reserve consumes the monthly AI token quota before a call.
+//
+// A call made outside any candidate's context — a maintenance task, a backfill — is
+// allowed through unmetered, because there is no candidate to charge. Those calls are
+// initiated by us and are visible in the per-purpose metrics, so the spend is not
+// invisible, just not attributed to a quota.
+func (a *TokenAccountant) Reserve(ctx context.Context, tokens int64) error {
+	userID, ok := a.resolveUser(ctx)
+	if !ok {
+		a.log.DebugContext(ctx, "ai call with no candidate in context; not metered",
+			slog.Int64("estimated_tokens", tokens))
+		return nil
+	}
+	_, err := a.svc.Consume(ctx, userID, QuotaAITokensMonth, tokens)
+	return err
+}
+
+// Record reconciles the reservation against actual usage.
+//
+// The estimate made before the call is approximate, so the difference is settled here:
+// an over-estimate returns the excess, an under-estimate consumes the remainder. Without
+// this, a consistently high estimate would quietly cost candidates allowance they never
+// used.
+func (a *TokenAccountant) Record(ctx context.Context, purpose string, actual int64) error {
+	userID, ok := a.resolveUser(ctx)
+	if !ok {
+		return nil
+	}
+
+	estimated, hasEstimate := reservedFromContext(ctx)
+	if !hasEstimate {
+		// No estimate to reconcile against: record the actual figure on top. Over-counts
+		// slightly in the rare path where the reservation was not tracked, which is the
+		// safe direction.
+		_, err := a.svc.Consume(ctx, userID, QuotaAITokensMonth, actual)
+		return err
+	}
+
+	switch {
+	case actual > estimated:
+		_, err := a.svc.Consume(ctx, userID, QuotaAITokensMonth, actual-estimated)
+		return err
+	case actual < estimated:
+		a.svc.Release(ctx, userID, QuotaAITokensMonth, estimated-actual)
+	}
+	return nil
+}

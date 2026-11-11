@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/apperr"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/ai"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/antivirus"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/docextract"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/events"
@@ -21,15 +23,34 @@ type Scanner interface {
 	Name() string
 }
 
+// Extractor performs structured CV extraction.
+//
+// Defined here as the narrow surface this domain needs, so cv does not depend on the AI
+// client's generic shape and can be tested with a fake that returns scripted
+// extractions.
+type Extractor interface {
+	ExtractCV(ctx context.Context, rawText string) (ExtractedCV, ExtractionMeta, error)
+}
+
+// ExtractionMeta is what the extractor reports about the call itself, for logging and
+// cost attribution.
+type ExtractionMeta struct {
+	Model         string
+	EngineVersion string
+	TotalTokens   int64
+	Attempts      int
+}
+
 // Worker runs the CV pipeline consumers.
 type Worker struct {
-	repo    Repository
-	store   ObjectStore
-	scanner Scanner
-	bus     events.Publisher
-	log     *slog.Logger
-	now     func() time.Time
-	limits  docextract.Limits
+	repo      Repository
+	store     ObjectStore
+	scanner   Scanner
+	extractor Extractor
+	bus       events.Publisher
+	log       *slog.Logger
+	now       func() time.Time
+	limits    docextract.Limits
 }
 
 // WorkerDeps are the worker's collaborators.
@@ -37,10 +58,15 @@ type WorkerDeps struct {
 	Repo    Repository
 	Store   ObjectStore
 	Scanner Scanner
-	Bus     events.Publisher
-	Logger  *slog.Logger
-	Now     func() time.Time
-	Limits  docextract.Limits
+	// Extractor may be nil, in which case the structure stage is skipped and versions
+	// are marked parsed on extracted text alone. Deliberately permitted so the
+	// pipeline runs end to end without an API key configured; the worker logs that the
+	// stage is disabled on startup rather than leaving it to be discovered.
+	Extractor Extractor
+	Bus       events.Publisher
+	Logger    *slog.Logger
+	Now       func() time.Time
+	Limits    docextract.Limits
 }
 
 // NewWorker builds the CV worker.
@@ -54,15 +80,20 @@ func NewWorker(d WorkerDeps) *Worker {
 		limits = docextract.DefaultLimits()
 	}
 	return &Worker{
-		repo:    d.Repo,
-		store:   d.Store,
-		scanner: d.Scanner,
-		bus:     d.Bus,
-		log:     d.Logger,
-		now:     now,
-		limits:  limits,
+		repo:      d.Repo,
+		store:     d.Store,
+		scanner:   d.Scanner,
+		extractor: d.Extractor,
+		bus:       d.Bus,
+		log:       d.Logger,
+		now:       now,
+		limits:    limits,
 	}
 }
+
+// StructuredExtractionEnabled reports whether the structure stage will run, so the
+// worker can say so at startup instead of letting it be discovered from missing data.
+func (w *Worker) StructuredExtractionEnabled() bool { return w.extractor != nil }
 
 // uploadedPayload is the cv.uploaded event body.
 type uploadedPayload struct {
@@ -107,6 +138,29 @@ func (w *Worker) Registrations() []events.Registration {
 			},
 			InFlight:   events.InFlightRetry,
 			AckWait:    2 * time.Minute,
+			MaxDeliver: 4,
+		},
+		{
+			Name:     "cv-structure",
+			Group:    "cv",
+			Stream:   "CV",
+			Subjects: []string{events.SubjectFor(events.TypeCVTextExtracted)},
+			Handler:  w.handleTextExtracted,
+			IdempotencyKey: func(env *events.Envelope) string {
+				var p textExtractedPayload
+				if err := env.Decode(&p); err != nil {
+					return ""
+				}
+				return "cv.structure:" + p.VersionID
+			},
+			// Re-extracting is internally idempotent: it overwrites the same version's
+			// derived rows, and correction preservation means a repeat cannot clobber a
+			// candidate's edit. So a crashed attempt is safe to redo.
+			InFlight: events.InFlightRetry,
+			// Generous: a thinking model on a long CV legitimately takes a minute or
+			// more, and an AckWait below the handler's real duration would have
+			// JetStream redeliver work that is still running.
+			AckWait:    5 * time.Minute,
 			MaxDeliver: 4,
 		},
 		{
@@ -330,20 +384,184 @@ func (w *Worker) handleScanned(ctx context.Context, env *events.Envelope) error 
 		"page_count": extracted.PageCount,
 	})
 
-	// Structured extraction is not implemented yet (MJF-005), so the version is marked
-	// parsed on text alone. This is a deliberate interim state rather than leaving
-	// every CV stuck in 'extracting': the candidate's CV is downloadable and usable,
-	// and the structured pass will re-run over stored text when it lands.
+	// With no extractor configured the pipeline stops here and the version is marked
+	// parsed on text alone. Not an error: the CV is downloadable and usable, and this
+	// keeps the platform working without an API key. The structure consumer will pick
+	// up the stored text whenever one is configured.
+	if w.extractor == nil {
+		if err := w.repo.MarkParsed(ctx, versionID, w.now()); err != nil {
+			return err
+		}
+		w.publish(ctx, env, events.TypeCVParsed, map[string]any{
+			"cv_id":      p.CVID,
+			"version_id": p.VersionID,
+			"user_id":    p.UserID,
+			"char_count": extracted.CharCount,
+			"structured": false,
+		})
+	}
+	return nil
+}
+
+// textExtractedPayload is the cv.text_extracted event body.
+type textExtractedPayload struct {
+	CVID      string `json:"cv_id"`
+	VersionID string `json:"version_id"`
+	UserID    string `json:"user_id"`
+	CharCount int    `json:"char_count"`
+}
+
+// handleTextExtracted runs structured extraction over a version's stored text.
+func (w *Worker) handleTextExtracted(ctx context.Context, env *events.Envelope) error {
+	if w.extractor == nil {
+		// The consumer should not be registered without an extractor, but acknowledging
+		// is better than dead-lettering a message nothing can process.
+		return nil
+	}
+
+	var p textExtractedPayload
+	if err := env.Decode(&p); err != nil {
+		return apperr.Unprocessable("undecodable_payload", "cv.text_extracted payload could not be decoded").
+			WithInternal(err)
+	}
+
+	versionID, err := uuid.Parse(p.VersionID)
+	if err != nil {
+		return apperr.Unprocessable("invalid_version_id", "cv.text_extracted carried an invalid version id").
+			WithInternal(err)
+	}
+	userID, err := uuid.Parse(p.UserID)
+	if err != nil {
+		return apperr.Unprocessable("invalid_user_id", "cv.text_extracted carried an invalid user id").
+			WithInternal(err)
+	}
+
+	log := w.log.With(slog.String("cv_version_id", p.VersionID))
+
+	if err := w.repo.UpdateParseStatus(ctx, versionID, ParseParsing, "structure"); err != nil {
+		if apperr.KindOf(err) == apperr.KindNotFound {
+			log.InfoContext(ctx, "cv version no longer exists; dropping the extraction")
+			return nil
+		}
+		return err
+	}
+
+	rawText, err := w.repo.RawText(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(rawText) == "" {
+		// The text-extract stage should have caught this. Reaching here means the row
+		// was changed underneath us, so fail terminally rather than calling a model
+		// with an empty document.
+		return w.failParse(ctx, env, p, versionID, ReasonNoExtractableText, "structure")
+	}
+
+	extracted, meta, err := w.extractor.ExtractCV(ctx, rawText)
+	if err != nil {
+		return w.handleExtractionError(ctx, env, p, versionID, err, log)
+	}
+
+	// Verification before persistence. An extraction whose evidence cannot be located
+	// is not trustworthy, and storing it would give the candidate a profile of invented
+	// detail that matching then acts on.
+	report := VerifyExtraction(extracted, rawText)
+
+	log.InfoContext(ctx, "cv extraction verified",
+		slog.String("model", meta.Model),
+		slog.Int("verified_fields", report.Verified),
+		slog.Int("unverified_fields", report.Unverified),
+		slog.Int("needs_review", report.NeedsReview),
+		slog.Float64("unverified_ratio", report.UnverifiedRatio()),
+		slog.Float64("average_confidence", report.AverageConfidence),
+		slog.Int64("total_tokens", meta.TotalTokens),
+		slog.Int("attempts", meta.Attempts),
+	)
+
+	if !report.Acceptable() {
+		// Terminal, and loud. This is the model failing to read the document, not a
+		// transient fault, and an operator needs to see it rather than have it retried.
+		log.ErrorContext(ctx, "cv extraction rejected: too few evidence quotes could be located",
+			slog.Float64("unverified_ratio", report.UnverifiedRatio()),
+			slog.Int("verified", report.Verified),
+			slog.Int("unverified", report.Unverified),
+		)
+		return w.failParse(ctx, env, p, versionID, ReasonSchemaViolation, "structure")
+	}
+
+	parsed := FromExtraction(versionID, userID, extracted, report, meta.EngineVersion)
+	skills := SkillsFromExtraction(extracted, report)
+
+	if err := w.repo.StoreParsedData(ctx, parsed, skills); err != nil {
+		if apperr.KindOf(err) == apperr.KindNotFound {
+			log.InfoContext(ctx, "cv version was deleted during extraction; dropping the result")
+			return nil
+		}
+		return err
+	}
+
 	if err := w.repo.MarkParsed(ctx, versionID, w.now()); err != nil {
 		return err
 	}
 
+	log.InfoContext(ctx, "cv parsed",
+		slog.Int("roles", len(parsed.Experience)),
+		slog.Int("skills", len(skills)),
+		slog.String("seniority", parsed.DetectedSeniority),
+		slog.Bool("needs_review", parsed.NeedsReview()),
+	)
+
 	w.publish(ctx, env, events.TypeCVParsed, map[string]any{
+		"cv_id":            p.CVID,
+		"version_id":       p.VersionID,
+		"user_id":          p.UserID,
+		"structured":       true,
+		"skill_count":      len(skills),
+		"role_count":       len(parsed.Experience),
+		"needs_review":     parsed.NeedsReview(),
+		"confidence_avg":   report.AverageConfidence,
+		"unverified_count": report.Unverified,
+	})
+	return nil
+}
+
+// handleExtractionError decides whether an AI failure is worth retrying.
+func (w *Worker) handleExtractionError(ctx context.Context, env *events.Envelope, p textExtractedPayload, versionID uuid.UUID, err error, log *slog.Logger) error {
+	if ai.Retryable(err) {
+		// Provider outage or throttling. Retryable, so the version stays in 'parsing'
+		// and redelivery picks it up.
+		log.WarnContext(ctx, "cv extraction failed transiently; will retry", slog.Any("error", err))
+		return apperr.Dependency("ai_provider", err)
+	}
+
+	reason := ReasonSchemaViolation
+	switch {
+	case errors.Is(err, ai.ErrRefused):
+		// Worth its own log line: on this platform a refusal usually means the CV or a
+		// job description contained something the classifier objected to, which an
+		// operator needs to see rather than have silently retried.
+		log.ErrorContext(ctx, "the provider declined to process this CV", slog.Any("error", err))
+	case errors.Is(err, ai.ErrTruncated):
+		reason = ReasonTooLong
+		log.InfoContext(ctx, "cv extraction output was truncated", slog.Any("error", err))
+	default:
+		log.ErrorContext(ctx, "cv extraction failed terminally", slog.Any("error", err))
+	}
+
+	return w.failParse(ctx, env, p, versionID, reason, "structure")
+}
+
+// failParse records a terminal parse failure and notifies.
+func (w *Worker) failParse(ctx context.Context, env *events.Envelope, p textExtractedPayload, versionID uuid.UUID, reason ParseFailureReason, stage string) error {
+	if err := w.repo.MarkParseFailed(ctx, versionID, reason, stage); err != nil {
+		return err
+	}
+	w.publish(ctx, env, events.TypeCVParseFailed, map[string]any{
 		"cv_id":      p.CVID,
 		"version_id": p.VersionID,
 		"user_id":    p.UserID,
-		"char_count": extracted.CharCount,
-		"structured": false,
+		"reason":     string(reason),
+		"stage":      stage,
 	})
 	return nil
 }

@@ -153,12 +153,18 @@ type Provider interface {
 }
 
 // TokenAccountant records spend. Satisfied by the entitlements service.
+//
+// Both methods take a plain token count rather than this package's Usage type, so the
+// implementer does not have to import it. That keeps the dependency pointing one way —
+// AI depends on nothing, and entitlements implements an interface it can satisfy
+// without knowing the AI layer exists. The detailed input/output breakdown is already
+// recorded in this package's metrics and logs; a quota only needs the total.
 type TokenAccountant interface {
 	// Reserve checks and consumes the monthly token quota before the call. Called with
 	// an estimate, because the true cost is unknown until the response arrives.
 	Reserve(ctx context.Context, tokens int64) error
-	// Record adjusts the reservation once actual usage is known.
-	Record(ctx context.Context, purpose string, usage Usage) error
+	// Record reconciles the reservation once actual usage is known.
+	Record(ctx context.Context, purpose string, totalTokens int64) error
 }
 
 // Validate checks a request before any provider is called.

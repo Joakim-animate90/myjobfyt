@@ -50,6 +50,7 @@ type Config struct {
 	SMTP      SMTPConfig
 	Antivirus AntivirusConfig
 	Extract   ExtractConfig
+	AI        AIConfig
 	Telemetry TelemetryConfig
 	Worker    WorkerConfig
 }
@@ -163,6 +164,25 @@ type SMTPConfig struct {
 	Timeout    time.Duration `env:"SMTP_TIMEOUT" envDefault:"15s"`
 }
 
+type AIConfig struct {
+	// APIKey may be empty, in which case the SDK resolves credentials itself — an
+	// environment variable, or an OAuth profile from `ant auth login`. An unset key
+	// does not mean there are no credentials.
+	APIKey string `env:"ANTHROPIC_API_KEY"`
+	// Enabled gates the structure stage. Off by default so the platform runs end to
+	// end with no provider configured and no spend; the worker says so at startup
+	// rather than leaving it to be discovered from missing data.
+	Enabled bool `env:"AI_ENABLED" envDefault:"false"`
+	// BaseURL points at a gateway or a test double.
+	BaseURL string `env:"AI_BASE_URL"`
+	// MaxRetries bounds the SDK's transport-level retries. Low, because the AI layer
+	// implements its own policy on top and two layers of retry multiply into a long
+	// stall on a failing provider.
+	MaxRetries int `env:"AI_MAX_RETRIES" envDefault:"1"`
+	// ExtractionTokenBudget caps one CV extraction, independently of the monthly quota.
+	ExtractionTokenBudget int64 `env:"AI_EXTRACTION_TOKEN_BUDGET" envDefault:"80000"`
+}
+
 type AntivirusConfig struct {
 	// Addr is the clamd TCP address. Empty selects the development pass-through
 	// scanner, which production validation refuses.
@@ -247,6 +267,9 @@ func (c *Config) Validate() error {
 	if c.SMTP.Port < 1 || c.SMTP.Port > 65535 {
 		problems = append(problems, "SMTP_PORT must be between 1 and 65535")
 	}
+	if c.AI.Enabled && c.AI.ExtractionTokenBudget < 1000 {
+		problems = append(problems, "AI_EXTRACTION_TOKEN_BUDGET is implausibly small")
+	}
 	if c.Extract.MaxPages < 1 {
 		problems = append(problems, "EXTRACT_MAX_PAGES must be at least 1")
 	}
@@ -290,6 +313,12 @@ func (c *Config) Validate() error {
 		}
 		if !strings.HasPrefix(c.SMTP.AppBaseURL, "https://") {
 			problems = append(problems, "APP_BASE_URL must use https in production")
+		}
+		if !c.AI.Enabled {
+			// Without the structure stage a CV never becomes matchable, so the product
+			// does not work. Better to refuse to start than to run a platform that
+			// silently produces empty profiles.
+			problems = append(problems, "AI_ENABLED must be true in production")
 		}
 		if c.Antivirus.Addr == "" {
 			// A pass-through scanner is indistinguishable from having none, and this
