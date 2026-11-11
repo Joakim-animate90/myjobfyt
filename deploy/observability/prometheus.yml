@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: myjobfyt-api
+    # host.docker.internal lets Prometheus in a container scrape the API running on the
+    # developer's host, which is how the API is normally run during development.
+    static_configs:
+      - targets: ["host.docker.internal:9090"]
+        labels:
+          service: api
+
+  - job_name: myjobfyt-worker
+    static_configs:
+      - targets: ["host.docker.internal:9092"]
+        labels:
+          service: worker
+
+  - job_name: nats
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["nats:8222"]

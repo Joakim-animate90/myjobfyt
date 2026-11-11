@@ -1,0 +1,148 @@
+# Local development environment.
+#
+# Every dependency the platform needs, with no cloud account required: Postgres, Redis,
+# NATS JetStream, S3-compatible object storage, a mail catcher and an antivirus daemon.
+# A developer runs `make dev` and has the full pipeline.
+#
+# Host ports are deliberately NOT the service defaults. A developer machine commonly
+# already has a Postgres on 5432 or a Redis on 6379 from another project, and silently
+# connecting to the wrong one is a confusing and occasionally destructive way to spend
+# an afternoon. Every port here is the default plus 10000, except where that collides.
+name: myjobfyt
+
+services:
+  postgres:
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_USER: myjobfyt
+      POSTGRES_PASSWORD: myjobfyt
+      POSTGRES_DB: myjobfyt
+      # Deterministic collation so index behaviour and sort order match production.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Include the database name: the default check passes while the target database
+      # is still being created, which lets migrations start too early and fail.
+      test: ["CMD-SHELL", "pg_isready -U myjobfyt -d myjobfyt"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      # Log slow queries in development so an N+1 is noticed while it is cheap to fix.
+      - -c
+      - log_min_duration_statement=200
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "16379:6379"
+    # No persistence: everything in Redis here is reconstructible from Postgres, and
+    # an AOF would only hide a bug where that stops being true.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2.10-alpine
+    ports:
+      - "14222:4222"   # client
+      - "18222:8222"   # monitoring
+    command:
+      - "-js"
+      - "-sd=/data"
+      - "-m=8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://localhost:8222/healthz 2>&1 | grep -q '200 OK'"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    # This host's registry access resolves minio only via the Chainguard mirror, which
+    # publishes a rolling tag rather than MinIO's RELEASE.* tags. Pinned by digest in
+    # CI (see .github/workflows) where the upstream registry is reachable.
+    image: chainguard/minio:latest
+    environment:
+      MINIO_ROOT_USER: myjobfyt
+      MINIO_ROOT_PASSWORD: myjobfyt-dev-secret
+    ports:
+      - "19000:9000"   # S3 API
+      - "19001:9001"   # console
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Catches outbound mail so development never sends a real application email to a
+  # real employer. UI on 8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "11025:1025"   # SMTP
+      - "18025:8025"   # web UI
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+
+  clamav:
+    image: clamav/clamav:1.4
+    ports:
+      - "13310:3310"
+    healthcheck:
+      test: ["CMD-SHELL", "clamdcheck.sh || exit 1"]
+      interval: 30s
+      timeout: 10s
+      # ClamAV downloads its signature database on first boot, which takes minutes.
+      start_period: 300s
+      retries: 10
+    profiles: ["full"]
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    ports:
+      - "19091:9090"
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    profiles: ["observability"]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "13001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    profiles: ["observability"]
+
+  loki:
+    image: grafana/loki:3.3.0
+    ports:
+      - "13100:3100"
+    profiles: ["observability"]
+
+volumes:
+  postgres_data:
+  nats_data:
+  minio_data:
+  grafana_data:

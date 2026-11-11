@@ -1,0 +1,33 @@
+# secrets and local environment
+.env
+.env.local
+*.pem
+*.key
+!**/testdata/**/*.pem
+
+# build output
+/bin/
+/backend/bin/
+*.test
+*.out
+coverage.*
+
+# node / next
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.pnp.*
+.yarn/
+
+# tooling
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# local data
+/tmp/
+/data/

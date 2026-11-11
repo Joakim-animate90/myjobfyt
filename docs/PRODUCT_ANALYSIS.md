@@ -1,3 +1,5 @@
+
+
 # Product Analysis — Reverse Engineering of LoopCV's Observable Behaviour
 
 **Date of investigation:** 2026-11-11
