@@ -120,10 +120,17 @@ func Conflict(code, format string, args ...any) *Error {
 }
 
 // QuotaExceeded reports an exhausted entitlement, including the information the client
-// needs to explain the limit and when it resets.
+// needs to explain the limit.
+//
+// resetsAt is omitted when empty rather than serialised as a zero value, because some
+// quotas measure a level and never reset on a clock.
 func QuotaExceeded(quotaKey string, limit int64, resetsAt string) *Error {
 	e := newf(KindQuotaExceeded, "quota_exceeded", "your plan limit for %s has been reached", quotaKey)
-	return e.WithMeta("quota_key", quotaKey).WithMeta("limit", limit).WithMeta("resets_at", resetsAt)
+	e = e.WithMeta("quota_key", quotaKey).WithMeta("limit", limit)
+	if resetsAt != "" {
+		e = e.WithMeta("resets_at", resetsAt)
+	}
+	return e
 }
 
 // RateLimited reports throttling, with the retry hint in seconds.

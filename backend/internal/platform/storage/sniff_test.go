@@ -105,3 +105,31 @@ func TestContentTypeExtensions(t *testing.T) {
 		t.Errorf("unknown extension = %q, want bin", got)
 	}
 }
+
+func TestIsSpecificDeclarationTreatsGenericTypesAsNoClaim(t *testing.T) {
+	// Browsers and command-line clients send application/octet-stream whenever they do
+	// not recognise an extension, which is routine for .docx. Treating that as a
+	// contradiction of the sniffed type would reject ordinary uploads.
+	generic := []string{
+		"", "   ", "application/octet-stream", "APPLICATION/OCTET-STREAM",
+		"binary/octet-stream", "application/octet-stream; charset=binary", "*/*",
+	}
+	for _, declared := range generic {
+		if storage.IsSpecificDeclaration(declared) {
+			t.Errorf("IsSpecificDeclaration(%q) = true, want false", declared)
+		}
+	}
+
+	specific := []string{
+		"application/pdf",
+		"application/pdf; charset=binary",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"image/png",
+		"text/html",
+	}
+	for _, declared := range specific {
+		if !storage.IsSpecificDeclaration(declared) {
+			t.Errorf("IsSpecificDeclaration(%q) = false, want true", declared)
+		}
+	}
+}

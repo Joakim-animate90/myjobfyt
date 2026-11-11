@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/config"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/cv"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/entitlements"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/identity"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/httpx"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/dataenc"
@@ -20,6 +22,7 @@ import (
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/mailer"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/postgres"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/redisx"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/storage"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/telemetry"
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -75,6 +78,15 @@ func run() error {
 	defer func() { _ = bus.Close() }()
 	log.Info("nats jetstream connected", slog.String("url", cfg.NATS.URL))
 
+	objectStore, err := storage.Open(ctx, cfg.Storage)
+	if err != nil {
+		return fmt.Errorf("object storage: %w", err)
+	}
+	log.Info("object storage ready",
+		slog.String("endpoint", cfg.Storage.Endpoint),
+		slog.String("bucket", cfg.Storage.Bucket),
+	)
+
 	cipher, err := buildCipher(cfg, log)
 	if err != nil {
 		return err
@@ -100,6 +112,10 @@ func run() error {
 
 	// --- domains ------------------------------------------------------------
 
+	entitlementsService := entitlements.NewService(
+		entitlements.NewPostgresRepository(db), redis, log, nil,
+	)
+
 	identityRepo := identity.NewPostgresRepository(db)
 	identityService := identity.NewService(identity.ServiceDeps{
 		Repo:   identityRepo,
@@ -114,6 +130,15 @@ func run() error {
 	identityHandler := identity.NewHandler(
 		identityService, identityMailer, cfg.Auth, cfg.Env, cfg.HTTP.TrustedProxy, log,
 	)
+
+	cvService := cv.NewService(cv.ServiceDeps{
+		Repo:         cv.NewPostgresRepository(db),
+		Store:        objectStore,
+		Entitlements: entitlementsService,
+		Bus:          bus,
+		Logger:       log,
+	})
+	cvHandler := cv.NewHandler(cvService, cfg.Storage.MaxCVBytes, log)
 
 	// --- http ---------------------------------------------------------------
 
@@ -132,6 +157,7 @@ func run() error {
 				}
 				return nil
 			}},
+			httpx.CheckFunc{DependencyName: "object_storage", Fn: objectStore.Ping},
 		},
 		Mount: func(r chi.Router) {
 			identityHandler.RegisterRoutes(r, identity.RouteDeps{
@@ -140,6 +166,7 @@ func run() error {
 				// whole domain.
 				CredentialRateLimit: httpx.AuthRateLimit(redis, cfg.HTTP.TrustedProxy),
 			})
+			cvHandler.RegisterRoutes(r, requireAuth)
 		},
 	})
 

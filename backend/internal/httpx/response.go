@@ -69,6 +69,14 @@ func write(w http.ResponseWriter, r *http.Request, status int, body Envelope) {
 	}
 }
 
+// ValidationError writes a single-field validation failure. A convenience for the
+// common case, so the field-error shape is not rebuilt at every call site.
+func ValidationError(w http.ResponseWriter, r *http.Request, field, code, message string) {
+	Error(w, r, apperr.ValidationFields([]apperr.FieldError{{
+		Field: field, Code: code, Message: message,
+	}}))
+}
+
 // StatusFor maps an application error Kind to an HTTP status code. This is the only
 // place in the codebase where that mapping exists.
 func StatusFor(kind apperr.Kind) int {

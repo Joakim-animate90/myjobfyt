@@ -169,7 +169,12 @@ func (s *S3Store) Put(ctx context.Context, tenantID uuid.UUID, declared string, 
 	}
 	// The declared type is advisory — a client can claim anything — but a mismatch is
 	// worth surfacing distinctly, because it is more often an attack than a mistake.
-	if declared != "" && !strings.EqualFold(declared, actual.String()) {
+	//
+	// A generic declaration is not a mismatch. Browsers and command-line clients send
+	// application/octet-stream whenever they do not recognise an extension, which is
+	// routine for .docx, so treating it as a contradiction would reject ordinary
+	// uploads from ordinary clients.
+	if isSpecificDeclaration(declared) && !strings.EqualFold(declared, actual.String()) {
 		return Object{}, ErrTypeMismatch
 	}
 
@@ -217,6 +222,28 @@ func (s *S3Store) Put(ctx context.Context, tenantID uuid.UUID, declared string, 
 		SizeBytes:   counting.n,
 		Checksum:    checksum,
 	}, nil
+}
+
+// genericDeclarations are content types that carry no information about the payload, so
+// they cannot contradict what the bytes say.
+var genericDeclarations = map[string]struct{}{
+	"":                         {},
+	"application/octet-stream": {},
+	"binary/octet-stream":      {},
+	"application/x-binary":     {},
+	"*/*":                      {},
+}
+
+// isSpecificDeclaration reports whether a declared content type is specific enough to
+// be worth comparing against the sniffed type.
+func isSpecificDeclaration(declared string) bool {
+	normalised := strings.ToLower(strings.TrimSpace(declared))
+	// Strip any parameters, e.g. "application/pdf; charset=binary".
+	if i := strings.IndexByte(normalised, ';'); i >= 0 {
+		normalised = strings.TrimSpace(normalised[:i])
+	}
+	_, generic := genericDeclarations[normalised]
+	return !generic
 }
 
 // deleteQuietly removes an object on a cleanup path, where a failure must not mask the
