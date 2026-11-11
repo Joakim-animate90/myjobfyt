@@ -167,8 +167,11 @@ economically viable, with AI spend as the sensitive term.
 
 ---
 
-## TD-10 — No request-scoped AI cost ceiling
-**Kind:** shortcut · **Where:** will be `internal/platform/ai`
+## TD-10 — No request-scoped AI cost ceiling — RESOLVED
+**Kind:** shortcut · **Where:** `internal/platform/ai`
+**Resolved:** 2026-11-11 in `MJF-004`. `Request.MaxTokenBudget` caps a single call
+independently of the monthly quota, enforced before the provider is called, with a test
+asserting an oversized document is refused without a call being made.
 
 The `ai_tokens_month` quota is monthly. A single pathological request — a 200-page PDF,
 or a retry loop — could consume a large share of a month's allowance in minutes.
@@ -205,7 +208,7 @@ preserving immutability.
 |---|---|---|---|
 | TD-04 | shortcut | **immediate** | `MJF-081` |
 | TD-03 | shortcut | high | `MJF-086` |
-| TD-10 | shortcut | high | `MJF-004` |
+| ~~TD-10~~ | ~~shortcut~~ | resolved | `MJF-004` |
 | TD-01 | shortcut | before launch | `MJF-087` |
 | TD-06 | shortcut | low | `MJF-070` |
 | TD-07 | deliberate | resolves naturally | `MJF-050` |

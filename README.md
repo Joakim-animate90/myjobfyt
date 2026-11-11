@@ -21,12 +21,14 @@ product is weak.
 | Identity — registration, sessions, JWKS, profiles | complete, running and verified end to end |
 | Entitlements — plans, quotas, feature gating | complete |
 | CV upload, library, antivirus, text extraction | complete, pipeline verified end to end |
-| CV structured parsing, tailoring, checker (needs the AI layer) | not started |
+| AI layer — provider abstraction, structured output, injection boundary | complete |
+| CV structured extraction — schema, evidence verification | schema and verification complete; persistence in progress |
+| CV tailoring, checker | not started |
 | Job acquisition, matching, applications, outreach, analytics, admin | not started |
 | Frontend | not started |
 | Kubernetes, Helm, FluxCD, CI/CD | not started |
 
-353 tests passing, plus integration tests against live MinIO.
+405 tests passing, plus integration tests against live MinIO.
 
 ## What makes this different
 
