@@ -19,11 +19,14 @@ product is weak.
 | Database schema (48 tables, 7 migrations) | complete, verified up/down against PostgreSQL 16 |
 | Platform foundation — config, errors, HTTP, logging, Postgres, Redis, JetStream | complete |
 | Identity — registration, sessions, JWKS, profiles | complete, running and verified end to end |
-| CV intelligence, job acquisition, matching, applications, outreach, analytics, admin | not started |
+| Entitlements — plans, quotas, feature gating | complete |
+| CV upload, library, antivirus, text extraction | complete, pipeline verified end to end |
+| CV structured parsing, tailoring, checker (needs the AI layer) | not started |
+| Job acquisition, matching, applications, outreach, analytics, admin | not started |
 | Frontend | not started |
 | Kubernetes, Helm, FluxCD, CI/CD | not started |
 
-254 tests passing.
+353 tests passing, plus integration tests against live MinIO.
 
 ## What makes this different
 
@@ -61,9 +64,10 @@ GitHub Actions, Prometheus, Grafana, Loki.
 Requires Go 1.26+, Docker and Docker Compose.
 
 ```bash
-make env      # create .env from .env.example
-make dev      # start dependencies and apply migrations
-make run-api  # start the API on :18080
+make env         # create .env from .env.example
+make dev         # start dependencies and apply migrations
+make run-api     # start the API on :18080
+make run-worker  # in another shell: start the CV pipeline worker
 ```
 
 Then, in another shell:
@@ -103,6 +107,29 @@ curl -s -c jar.txt -X POST localhost:18080/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"you@example.com","password":"correct-horse-battery-staple"}'
 ```
+
+### Trying the CV pipeline
+
+With `make run-worker` running in another shell:
+
+```bash
+AT=<access_token from the login response>
+
+# upload a CV
+curl -s -X POST localhost:18080/v1/cvs \
+  -H "Authorization: Bearer $AT" \
+  -F "file=@/path/to/your-cv.pdf;type=application/pdf" \
+  -F "label=My CV"
+
+# poll it: pending -> scanning -> extracting -> parsed, usually within a second
+curl -s localhost:18080/v1/cvs -H "Authorization: Bearer $AT" | jq '.data.cvs[0].latest_version'
+```
+
+Antivirus is disabled by default in development — the worker warns loudly on every
+upload, and production refuses to start without `ANTIVIRUS_ADDR`. To run the real
+scanner: `docker compose --profile full up -d clamav` and set
+`ANTIVIRUS_ADDR=localhost:13310` (it takes a few minutes to download signatures on
+first start).
 
 ### Useful targets
 

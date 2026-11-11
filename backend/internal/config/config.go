@@ -48,6 +48,8 @@ type Config struct {
 	Auth      AuthConfig
 	Crypto    CryptoConfig
 	SMTP      SMTPConfig
+	Antivirus AntivirusConfig
+	Extract   ExtractConfig
 	Telemetry TelemetryConfig
 	Worker    WorkerConfig
 }
@@ -161,6 +163,19 @@ type SMTPConfig struct {
 	Timeout    time.Duration `env:"SMTP_TIMEOUT" envDefault:"15s"`
 }
 
+type AntivirusConfig struct {
+	// Addr is the clamd TCP address. Empty selects the development pass-through
+	// scanner, which production validation refuses.
+	Addr     string        `env:"ANTIVIRUS_ADDR"`
+	Timeout  time.Duration `env:"ANTIVIRUS_TIMEOUT" envDefault:"60s"`
+	MaxBytes int64         `env:"ANTIVIRUS_MAX_BYTES" envDefault:"26214400"`
+}
+
+type ExtractConfig struct {
+	MaxPages int `env:"EXTRACT_MAX_PAGES" envDefault:"20"`
+	MaxChars int `env:"EXTRACT_MAX_CHARS" envDefault:"200000"`
+}
+
 type CryptoConfig struct {
 	// DataKeys is the column-encryption keyring, primary first, each entry in
 	// "id:base64-32-bytes" form. Generate one with `make crypto-key`.
@@ -232,6 +247,12 @@ func (c *Config) Validate() error {
 	if c.SMTP.Port < 1 || c.SMTP.Port > 65535 {
 		problems = append(problems, "SMTP_PORT must be between 1 and 65535")
 	}
+	if c.Extract.MaxPages < 1 {
+		problems = append(problems, "EXTRACT_MAX_PAGES must be at least 1")
+	}
+	if c.Extract.MaxChars < 1000 {
+		problems = append(problems, "EXTRACT_MAX_CHARS is implausibly small")
+	}
 	if c.Storage.MaxCVBytes < 1024 {
 		problems = append(problems, "STORAGE_MAX_CV_BYTES is implausibly small")
 	}
@@ -269,6 +290,11 @@ func (c *Config) Validate() error {
 		}
 		if !strings.HasPrefix(c.SMTP.AppBaseURL, "https://") {
 			problems = append(problems, "APP_BASE_URL must use https in production")
+		}
+		if c.Antivirus.Addr == "" {
+			// A pass-through scanner is indistinguishable from having none, and this
+			// endpoint accepts arbitrary files from the internet.
+			problems = append(problems, "ANTIVIRUS_ADDR is required in production")
 		}
 		if len(c.Crypto.DataKeys) == 0 {
 			// Without a key, phone numbers and SMTP passwords would have to be stored

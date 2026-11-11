@@ -179,7 +179,10 @@ func (rt *Runtime) startOne(ctx context.Context, reg Registration) error {
 		// Explicit backoff rather than a flat redelivery interval: a dependency that
 		// is briefly unavailable recovers on the second attempt, while one that is
 		// genuinely down is not hammered every AckWait seconds.
-		BackOff: redeliveryBackoff,
+		// JetStream requires MaxDeliver to exceed the number of backoff entries, so the
+		// schedule is trimmed to fit rather than making every registration author know
+		// that constraint. A consumer with MaxDeliver=4 gets the first three delays.
+		BackOff: backoffSchedule(reg.MaxDeliver),
 	}
 
 	consumer, err := stream.CreateOrUpdateConsumer(ctx, cfg)
@@ -373,6 +376,22 @@ var redeliveryBackoff = []time.Duration{
 	15 * time.Second,
 	1 * time.Minute,
 	5 * time.Minute,
+}
+
+// backoffSchedule returns the backoff entries valid for a given MaxDeliver.
+//
+// JetStream rejects a consumer whose BackOff is at least as long as MaxDeliver, because
+// the last entry could never be used. Trimming here keeps the constraint in one place
+// instead of in every registration.
+func backoffSchedule(maxDeliver int) []time.Duration {
+	if maxDeliver <= 1 {
+		// A single delivery never backs off, and an empty schedule is valid.
+		return nil
+	}
+	if maxDeliver-1 < len(redeliveryBackoff) {
+		return redeliveryBackoff[:maxDeliver-1]
+	}
+	return redeliveryBackoff
 }
 
 // backoffFor returns the delay before the next delivery attempt. deliveries is

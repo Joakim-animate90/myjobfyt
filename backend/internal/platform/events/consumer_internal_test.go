@@ -607,3 +607,48 @@ func TestUndecodableMessageIsDeadLetteredWithItsRawBody(t *testing.T) {
 		t.Errorf("subject = %q, want myjobfyt.dlq.unknown", dls[0].subject)
 	}
 }
+
+func TestBackoffScheduleSatisfiesJetStreamsConstraint(t *testing.T) {
+	// JetStream rejects a consumer whose BackOff length is at least MaxDeliver, with
+	// "max deliver is required to be > length of backoff values". Getting this wrong
+	// means the worker fails to start, so the runtime trims the schedule rather than
+	// requiring every registration author to know the rule.
+	for maxDeliver := 1; maxDeliver <= 12; maxDeliver++ {
+		schedule := backoffSchedule(maxDeliver)
+		if len(schedule) >= maxDeliver {
+			t.Errorf("MaxDeliver=%d produced %d backoff entries; JetStream requires fewer than MaxDeliver",
+				maxDeliver, len(schedule))
+		}
+	}
+}
+
+func TestBackoffScheduleKeepsTheFullCurveWhenItFits(t *testing.T) {
+	// With generous redelivery the whole curve should be used, so a long outage backs
+	// off to five minutes rather than retrying every second.
+	schedule := backoffSchedule(10)
+	if len(schedule) != len(redeliveryBackoff) {
+		t.Fatalf("got %d entries, want the full %d", len(schedule), len(redeliveryBackoff))
+	}
+}
+
+func TestBackoffScheduleTrimsFromTheFront(t *testing.T) {
+	// A trimmed schedule must keep the SHORT delays, not the long ones: a consumer with
+	// few attempts should use them quickly rather than waiting five minutes for its
+	// only retry.
+	schedule := backoffSchedule(3)
+	if len(schedule) != 2 {
+		t.Fatalf("got %d entries, want 2", len(schedule))
+	}
+	if schedule[0] != redeliveryBackoff[0] || schedule[1] != redeliveryBackoff[1] {
+		t.Fatalf("schedule = %v, want the first two entries %v", schedule, redeliveryBackoff[:2])
+	}
+}
+
+func TestSingleDeliveryHasNoBackoff(t *testing.T) {
+	if schedule := backoffSchedule(1); len(schedule) != 0 {
+		t.Fatalf("MaxDeliver=1 produced %v, want no backoff entries", schedule)
+	}
+	if schedule := backoffSchedule(0); len(schedule) != 0 {
+		t.Fatalf("MaxDeliver=0 produced %v, want no backoff entries", schedule)
+	}
+}
