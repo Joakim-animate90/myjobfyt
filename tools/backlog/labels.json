@@ -1,0 +1,117 @@
+[
+ {
+  "name": "priority/critical",
+  "color": "b60205",
+  "description": "critical priority"
+ },
+ {
+  "name": "priority/high",
+  "color": "d93f0b",
+  "description": "high priority"
+ },
+ {
+  "name": "priority/medium",
+  "color": "fbca04",
+  "description": "medium priority"
+ },
+ {
+  "name": "priority/low",
+  "color": "0e8a16",
+  "description": "low priority"
+ },
+ {
+  "name": "area/architecture",
+  "color": "5319e7",
+  "description": "architecture subsystem"
+ },
+ {
+  "name": "area/backend",
+  "color": "1d76db",
+  "description": "backend subsystem"
+ },
+ {
+  "name": "area/frontend",
+  "color": "0052cc",
+  "description": "frontend subsystem"
+ },
+ {
+  "name": "area/database",
+  "color": "006b75",
+  "description": "database subsystem"
+ },
+ {
+  "name": "area/ai",
+  "color": "8b5cf6",
+  "description": "ai subsystem"
+ },
+ {
+  "name": "area/job-acquisition",
+  "color": "0b7285",
+  "description": "job-acquisition subsystem"
+ },
+ {
+  "name": "area/integrations",
+  "color": "0969da",
+  "description": "integrations subsystem"
+ },
+ {
+  "name": "area/security",
+  "color": "b60205",
+  "description": "security subsystem"
+ },
+ {
+  "name": "area/infrastructure",
+  "color": "5a5a5a",
+  "description": "infrastructure subsystem"
+ },
+ {
+  "name": "area/devops",
+  "color": "444444",
+  "description": "devops subsystem"
+ },
+ {
+  "name": "area/observability",
+  "color": "c2185b",
+  "description": "observability subsystem"
+ },
+ {
+  "name": "area/testing",
+  "color": "0e8a16",
+  "description": "testing subsystem"
+ },
+ {
+  "name": "area/performance",
+  "color": "e99695",
+  "description": "performance subsystem"
+ },
+ {
+  "name": "area/documentation",
+  "color": "bfdadc",
+  "description": "documentation subsystem"
+ },
+ {
+  "name": "complexity/XS",
+  "color": "ededed",
+  "description": "complexity XS"
+ },
+ {
+  "name": "complexity/S",
+  "color": "d4d4d4",
+  "description": "complexity S"
+ },
+ {
+  "name": "complexity/M",
+  "color": "b0b0b0",
+  "description": "complexity M"
+ },
+ {
+  "name": "complexity/L",
+  "color": "8a8a8a",
+  "description": "complexity L"
+ },
+ {
+  "name": "complexity/XL",
+  "color": "5f5f5f",
+  "description": "complexity XL"
+ }
+]

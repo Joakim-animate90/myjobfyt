@@ -1,0 +1,61 @@
+MJF-001	MJF-001 — Object storage client with magic-byte validation and AV scanning	priority/critical,area/backend,complexity/M	M1 — CV Intelligence
+MJF-002	MJF-002 — CV upload endpoint and cv_documents/cv_versions persistence	priority/critical,area/backend,complexity/M	M1 — CV Intelligence
+MJF-003	MJF-003 — Deterministic text extraction from PDF and DOCX	priority/critical,area/backend,complexity/M	M1 — CV Intelligence
+MJF-004	MJF-004 — Provider-agnostic AI client with structured output, retries and token accounting	priority/critical,area/ai,complexity/L	M1 — CV Intelligence
+MJF-005	MJF-005 — Structured CV extraction with per-field confidence and source offsets	priority/critical,area/ai,complexity/L	M1 — CV Intelligence
+MJF-006	MJF-006 — Skill normalisation against a canonical taxonomy	priority/high,area/ai,complexity/M	M1 — CV Intelligence
+MJF-007	MJF-007 — CV parse worker pipeline with idempotency and dead-lettering	priority/critical,area/backend,complexity/M	M1 — CV Intelligence
+MJF-008	MJF-008 — AI CV checker with deterministic rules plus an LLM pass	priority/high,area/ai,complexity/L	M1 — CV Intelligence
+MJF-009	MJF-009 — Embeddings with a lexical fallback	priority/high,area/ai,complexity/M	M1 — CV Intelligence
+MJF-010	MJF-010 — CV library, versioning and soft-delete protection	priority/high,area/backend,complexity/S	M1 — CV Intelligence
+MJF-011	MJF-011 — CV tailoring with mandatory factual containment validation	priority/critical,area/ai,complexity/L	M1 — CV Intelligence
+MJF-012	MJF-012 — CV builder with a sandboxed, network-isolated PDF renderer	priority/medium,area/backend,complexity/L	M1 — CV Intelligence
+MJF-020	MJF-020 — Adapter contract, registry and per-source circuit breaker	priority/critical,area/job-acquisition,complexity/M	M2 — Job Acquisition
+MJF-021	MJF-021 — Adzuna adapter	priority/critical,area/integrations,complexity/M	M2 — Job Acquisition
+MJF-022	MJF-022 — Remote-only feed adapters (Remotive, RemoteOK, Arbeitnow)	priority/high,area/integrations,complexity/S	M2 — Job Acquisition
+MJF-023	MJF-023 — ATS board adapters (Greenhouse, Lever, Ashby)	priority/high,area/integrations,complexity/L	M2 — Job Acquisition
+MJF-024	MJF-024 — Discovery scheduler keyed by search specification	priority/critical,area/backend,complexity/L	M2 — Job Acquisition
+MJF-025	MJF-025 — Normalisation: company identity, location, salary, work mode, language	priority/critical,area/backend,complexity/L	M2 — Job Acquisition
+MJF-026	MJF-026 — Fingerprint deduplication with near-duplicate linking	priority/critical,area/backend,complexity/L	M2 — Job Acquisition
+MJF-027	MJF-027 — Posting liveness re-check and expiry cascade	priority/high,area/backend,complexity/S	M2 — Job Acquisition
+MJF-028	MJF-028 — Loops domain: wizard, lifecycle with pause, and config versioning	priority/critical,area/backend,complexity/L	M2 — Job Acquisition
+MJF-030	MJF-030 — Hard filters with a persisted rejection taxonomy	priority/critical,area/backend,complexity/M	M3 — Matching
+MJF-031	MJF-031 — Explainable multi-dimensional match scoring	priority/critical,area/backend,complexity/XL	M3 — Matching
+MJF-032	MJF-032 — Match fan-out with an inverted index prefilter	priority/high,area/performance,complexity/M	M3 — Matching
+MJF-033	MJF-033 — Per-candidate company cooldown	priority/high,area/backend,complexity/S	M3 — Matching
+MJF-034	MJF-034 — Backfill rescoring on config or CV change	priority/high,area/backend,complexity/M	M3 — Matching
+MJF-040	MJF-040 — Deterministic submission method selection with recorded reasoning	priority/critical,area/backend,complexity/M	M4 — Application Orchestration
+MJF-041	MJF-041 — Application preparation materialising immutable artefacts	priority/critical,area/backend,complexity/L	M4 — Application Orchestration
+MJF-042	MJF-042 — Authorisation: per-application and bounded standing consent	priority/critical,area/security,complexity/L	M4 — Application Orchestration
+MJF-043	MJF-043 — Submission adapters with idempotency and honest outcome reporting	priority/critical,area/backend,complexity/XL	M4 — Application Orchestration
+MJF-044	MJF-044 — Screening questions with saved answers and sensitive-category refusal	priority/high,area/ai,complexity/L	M4 — Application Orchestration
+MJF-045	MJF-045 — Application status derived from an append-only event log	priority/critical,area/backend,complexity/M	M4 — Application Orchestration
+MJF-046	MJF-046 — Browser extension API with no credential relay	priority/high,area/security,complexity/L	M4 — Application Orchestration
+MJF-050	MJF-050 — Next.js foundation: App Router, Tailwind, shadcn/ui, React Query, Zod	priority/critical,area/frontend,complexity/M	M5 — Frontend
+MJF-051	MJF-051 — Authentication and onboarding screens	priority/critical,area/frontend,complexity/L	M5 — Frontend
+MJF-052	MJF-052 — CV library, upload, parse-review and CV checker screens	priority/high,area/frontend,complexity/L	M5 — Frontend
+MJF-053	MJF-053 — Loop configuration wizard and loop management	priority/critical,area/frontend,complexity/L	M5 — Frontend
+MJF-054	MJF-054 — Matches, rejected-matches browser and match detail	priority/critical,area/frontend,complexity/L	M5 — Frontend
+MJF-055	MJF-055 — Application management, Kanban board and the authorisation flow	priority/critical,area/frontend,complexity/XL	M5 — Frontend
+MJF-056	MJF-056 — Questions queue, analytics dashboard and notifications	priority/high,area/frontend,complexity/L	M5 — Frontend
+MJF-060	MJF-060 — Recruiter contact discovery with recorded provenance	priority/medium,area/integrations,complexity/M	M6 — Outreach, Analytics & Admin
+MJF-061	MJF-061 — Outreach sending with suppression, SMTP support and bounce handling	priority/medium,area/backend,complexity/L	M6 — Outreach, Analytics & Admin
+MJF-062	MJF-062 — Open and reply tracking with an inbox	priority/low,area/backend,complexity/M	M6 — Outreach, Analytics & Admin
+MJF-063	MJF-063 — Analytics rollups reconciling with the event log	priority/medium,area/backend,complexity/M	M6 — Outreach, Analytics & Admin
+MJF-064	MJF-064 — Admin dashboard with end-to-end workflow tracing	priority/high,area/observability,complexity/XL	M6 — Outreach, Analytics & Admin
+MJF-065	MJF-065 — Subscriptions, entitlements and webhook-authoritative billing	priority/high,area/backend,complexity/L	M6 — Outreach, Analytics & Admin
+MJF-066	MJF-066 — GDPR data export and account erasure	priority/high,area/security,complexity/L	M6 — Outreach, Analytics & Admin
+MJF-070	MJF-070 — Production Dockerfiles for api, worker, scheduler and migrate	priority/critical,area/infrastructure,complexity/M	M7 — Infrastructure & GitOps
+MJF-071	MJF-071 — Helm chart with development, staging and production values	priority/critical,area/infrastructure,complexity/L	M7 — Infrastructure & GitOps
+MJF-072	MJF-072 — FluxCD GitOps repository structure with SOPS-encrypted secrets	priority/high,area/devops,complexity/L	M7 — Infrastructure & GitOps
+MJF-073	MJF-073 — VPS bootstrap and hardening scripts	priority/high,area/devops,complexity/L	M7 — Infrastructure & GitOps
+MJF-074	MJF-074 — Observability stack: OpenTelemetry Collector, Prometheus, Grafana, Loki, alerting	priority/high,area/observability,complexity/L	M7 — Infrastructure & GitOps
+MJF-075	MJF-075 — Terraform for VPS, DNS, object storage and backups	priority/medium,area/infrastructure,complexity/M	M7 — Infrastructure & GitOps
+MJF-080	MJF-080 — CI workflow: format, vet, lint, test, race, coverage, migration validation	priority/critical,area/devops,complexity/M	M8 — CI/CD & Hardening
+MJF-081	MJF-081 — Integration test suite with testcontainers	priority/critical,area/testing,complexity/L	M8 — CI/CD & Hardening
+MJF-082	MJF-082 — End-to-end journey tests	priority/high,area/testing,complexity/L	M8 — CI/CD & Hardening
+MJF-083	MJF-083 — CD workflow with environment promotion	priority/high,area/devops,complexity/M	M8 — CI/CD & Hardening
+MJF-084	MJF-084 — Security scanning: dependencies, containers, secrets, SAST	priority/critical,area/security,complexity/M	M8 — CI/CD & Hardening
+MJF-085	MJF-085 — Load, concurrency and failure-recovery testing	priority/medium,area/performance,complexity/L	M8 — CI/CD & Hardening
+MJF-086	MJF-086 — OpenAPI specification generated from and verified against the implementation	priority/high,area/documentation,complexity/M	M8 — CI/CD & Hardening
+MJF-087	MJF-087 — Security documentation: SECURITY.md, THREAT_MODEL.md, SECURITY_CHECKLIST.md	priority/high,area/documentation,complexity/M	M8 — CI/CD & Hardening

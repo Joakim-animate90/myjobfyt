@@ -1,0 +1,34 @@
+[
+ {
+  "title": "M1 \u2014 CV Intelligence",
+  "description": "Turn an uploaded document into structured, matchable candidate data, and generate tailored materials that never fabricate anything."
+ },
+ {
+  "title": "M2 \u2014 Job Acquisition",
+  "description": "Bring real postings in from lawfully accessible sources, normalised and deduplicated, with loops as the search abstraction."
+ },
+ {
+  "title": "M3 \u2014 Matching",
+  "description": "Score postings against candidates explainably, and retain rejections with reasons so a thin funnel is self-diagnosable."
+ },
+ {
+  "title": "M4 \u2014 Application Orchestration",
+  "description": "Prepare, authorise and submit applications, with consent recorded and duplicates structurally impossible."
+ },
+ {
+  "title": "M5 \u2014 Frontend",
+  "description": "A polished interface where every visible feature is wired to real backend behaviour and no number is presented more confidently than the data supports."
+ },
+ {
+  "title": "M6 \u2014 Outreach, Analytics & Admin",
+  "description": "Lawful recruiter outreach, analytics that reconcile with the event log, operational visibility, billing and GDPR obligations."
+ },
+ {
+  "title": "M7 \u2014 Infrastructure & GitOps",
+  "description": "Containerise, chart, and deploy to a VPS Kubernetes cluster reconciled from Git, with observability and a tested restore path."
+ },
+ {
+  "title": "M8 \u2014 CI/CD & Hardening",
+  "description": "Separate CI from CD, make the safety invariants continuously verified rather than verified once, and document the security posture."
+ }
+]
