@@ -277,6 +277,21 @@ func (s *Service) DownloadURL(ctx context.Context, userID, documentID uuid.UUID)
 	return s.store.PresignedGet(ctx, version.StorageKey, name)
 }
 
+// ListVersions returns a document's version history.
+func (s *Service) ListVersions(ctx context.Context, userID, documentID uuid.UUID) (*Document, []*Version, error) {
+	// The document lookup establishes ownership and gives the client the label and
+	// default flag it needs to render the history in context.
+	document, err := s.repo.DocumentByID(ctx, userID, documentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	versions, err := s.repo.ListVersions(ctx, userID, documentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return document, versions, nil
+}
+
 // Rename changes a document's label.
 func (s *Service) Rename(ctx context.Context, userID, documentID uuid.UUID, label string) error {
 	label = strings.TrimSpace(label)

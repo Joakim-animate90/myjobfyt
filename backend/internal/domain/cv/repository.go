@@ -21,6 +21,7 @@ type Repository interface {
 	ListDocuments(ctx context.Context, userID uuid.UUID) ([]*Document, error)
 	VersionByID(ctx context.Context, userID, versionID uuid.UUID) (*Version, error)
 	LatestVersion(ctx context.Context, userID, documentID uuid.UUID) (*Version, error)
+	ListVersions(ctx context.Context, userID, documentID uuid.UUID) ([]*Version, error)
 	NextVersionNo(ctx context.Context, userID, documentID uuid.UUID) (int, error)
 
 	UpdateAVStatus(ctx context.Context, versionID uuid.UUID, status AVStatus, at time.Time) error
@@ -324,6 +325,38 @@ func (r *PostgresRepository) LatestVersion(ctx context.Context, userID, document
 		return nil, apperr.Internalf(err, "select latest cv version")
 	}
 	return v, nil
+}
+
+// ListVersions returns every version of a document the user owns, newest first.
+//
+// Version history is user-visible, not just an implementation detail: a candidate who
+// uploads a revised CV needs to see which version a given application actually used,
+// and that is the whole point of pinning versions rather than overwriting.
+func (r *PostgresRepository) ListVersions(ctx context.Context, userID, documentID uuid.UUID) ([]*Version, error) {
+	// Ownership is established by the user_id predicate on cv_versions itself rather
+	// than by a prior lookup, so there is no window between the check and the read.
+	q := `SELECT ` + versionColumns + ` FROM cv_versions v
+	      WHERE v.cv_document_id = $1 AND v.user_id = $2
+	      ORDER BY v.version_no DESC`
+
+	rows, err := r.db.Querier(ctx).Query(ctx, q, documentID, userID)
+	if err != nil {
+		return nil, apperr.Internalf(err, "list cv versions")
+	}
+	defer rows.Close()
+
+	var out []*Version
+	for rows.Next() {
+		v, serr := scanVersion(rows)
+		if serr != nil {
+			return nil, apperr.Internalf(serr, "scan cv version row")
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internalf(err, "iterate cv versions")
+	}
+	return out, nil
 }
 
 // UpdateAVStatus records the antivirus verdict.

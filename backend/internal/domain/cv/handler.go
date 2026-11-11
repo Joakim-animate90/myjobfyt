@@ -39,6 +39,7 @@ func (h *Handler) RegisterRoutes(r chi.Router, requireAuth func(http.Handler) ht
 			r.Route("/{cvID}", func(r chi.Router) {
 				r.Get("/", h.get)
 				r.With(h.uploadBodyLimit).Post("/versions", h.uploadVersion)
+				r.Get("/versions", h.listVersions)
 				r.Get("/download", h.download)
 				r.Patch("/", h.rename)
 				r.Post("/default", h.setDefault)
@@ -190,6 +191,34 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, r, http.StatusOK, map[string]any{"cv": toDocumentResponse(document)})
+}
+
+func (h *Handler) listVersions(w http.ResponseWriter, r *http.Request) {
+	userID, err := principalUserID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	documentID, err := uuid.Parse(chi.URLParam(r, "cvID"))
+	if err != nil {
+		httpx.Error(w, r, apperr.NotFound("CV"))
+		return
+	}
+
+	document, versions, err := h.svc.ListVersions(r.Context(), userID, documentID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+
+	out := make([]versionResponse, 0, len(versions))
+	for _, v := range versions {
+		out = append(out, *toVersionResponse(v))
+	}
+	httpx.JSON(w, r, http.StatusOK, map[string]any{
+		"cv":       toDocumentResponse(document),
+		"versions": out,
+	})
 }
 
 func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
