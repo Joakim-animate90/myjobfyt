@@ -144,3 +144,33 @@ func TestParsePaginationRejectsNonNumeric(t *testing.T) {
 		t.Fatalf("err = %v, want a validation error", err)
 	}
 }
+
+func TestBindNamesTheUnknownField(t *testing.T) {
+	// "not valid JSON" would send a client hunting for a syntax error that is not
+	// there; naming the field is actionable.
+	var in registerRequest
+	err := httpx.Bind(post(`{"email":"a@b.com","password":"correct-horse-battery","accepted_terms":true,"role":"admin"}`), &in)
+
+	e := apperr.As(err)
+	if e == nil {
+		t.Fatalf("err = %v, want an *apperr.Error", err)
+	}
+	if len(e.Fields) != 1 {
+		t.Fatalf("fields = %+v, want exactly one", e.Fields)
+	}
+	if e.Fields[0].Field != "role" {
+		t.Errorf("field = %q, want role", e.Fields[0].Field)
+	}
+	if e.Fields[0].Code != "unknown_field" {
+		t.Errorf("code = %q, want unknown_field", e.Fields[0].Code)
+	}
+}
+
+func TestBindStillRejectsGenuinelyMalformedJSON(t *testing.T) {
+	var in registerRequest
+	err := httpx.Bind(post(`{"email": "a@b.com", oops}`), &in)
+	e := apperr.As(err)
+	if e == nil || e.Code != "malformed_json" {
+		t.Fatalf("err = %v, want malformed_json", err)
+	}
+}

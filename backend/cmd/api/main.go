@@ -1,0 +1,253 @@
+// Command api serves the MyJobFyt REST API.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/config"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/identity"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/httpx"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/dataenc"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/events"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/mailer"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/postgres"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/redisx"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/telemetry"
+	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "api: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	log := telemetry.NewLogger(cfg.Log, cfg.ServiceName+"-api", cfg.Version)
+	slog.SetDefault(log)
+
+	log.Info("starting api",
+		slog.String("env", string(cfg.Env)),
+		slog.String("version", cfg.Version),
+		slog.String("addr", cfg.HTTP.Addr),
+	)
+
+	// Signals are wired before any dependency is opened, so a Ctrl-C during a slow
+	// startup is honoured instead of leaving half-open connections behind.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// --- dependencies -------------------------------------------------------
+
+	db, err := postgres.Open(ctx, cfg.Postgres)
+	if err != nil {
+		return fmt.Errorf("postgres: %w", err)
+	}
+	defer db.Close()
+	log.Info("postgres connected", slog.Int("max_conns", int(cfg.Postgres.MaxConns)))
+
+	redis, err := redisx.Open(ctx, cfg.Redis)
+	if err != nil {
+		return fmt.Errorf("redis: %w", err)
+	}
+	defer func() { _ = redis.Close() }()
+	log.Info("redis connected", slog.String("addr", cfg.Redis.Addr))
+
+	bus, err := events.Connect(ctx, cfg.NATS, log)
+	if err != nil {
+		return fmt.Errorf("nats: %w", err)
+	}
+	defer func() { _ = bus.Close() }()
+	log.Info("nats jetstream connected", slog.String("url", cfg.NATS.URL))
+
+	cipher, err := buildCipher(cfg, log)
+	if err != nil {
+		return err
+	}
+
+	tokens, err := identity.NewTokenIssuer(cfg.Auth, cfg.Env)
+	if err != nil {
+		return fmt.Errorf("auth tokens: %w", err)
+	}
+	if cfg.Auth.JWTPrivateKeyPEM == "" {
+		// Worth saying out loud: an ephemeral key means every restart invalidates
+		// every session, which is confusing if you do not know it is happening.
+		log.Warn("no JWT signing key configured; using an ephemeral development key — all sessions end on restart")
+	}
+
+	var emailSender mailer.Sender
+	if cfg.SMTP.Host == "" {
+		emailSender = mailer.NewLoggingSender(log)
+	} else {
+		emailSender = mailer.NewSMTPSender(cfg.SMTP, log)
+	}
+	identityMailer := mailer.NewIdentityMailer(emailSender, cfg.SMTP.AppBaseURL, log)
+
+	// --- domains ------------------------------------------------------------
+
+	identityRepo := identity.NewPostgresRepository(db)
+	identityService := identity.NewService(identity.ServiceDeps{
+		Repo:   identityRepo,
+		Tx:     db,
+		Hasher: identity.NewPasswordHasher(cfg.Auth),
+		Tokens: tokens,
+		Cipher: cipher,
+		Bus:    bus,
+		Config: cfg.Auth,
+		Logger: log,
+	})
+	identityHandler := identity.NewHandler(
+		identityService, identityMailer, cfg.Auth, cfg.Env, cfg.HTTP.TrustedProxy, log,
+	)
+
+	// --- http ---------------------------------------------------------------
+
+	requireAuth := httpx.RequireAuth(identityHandler, identity.AudienceAPI)
+
+	router := httpx.NewRouter(httpx.RouterDeps{
+		Config:  cfg,
+		Logger:  log,
+		Limiter: redis,
+		Health: []httpx.HealthChecker{
+			httpx.CheckFunc{DependencyName: "postgres", Fn: db.Ping},
+			httpx.CheckFunc{DependencyName: "redis", Fn: redis.Ping},
+			httpx.CheckFunc{DependencyName: "nats", Fn: func(context.Context) error {
+				if !bus.Healthy() {
+					return errors.New("jetstream connection is down")
+				}
+				return nil
+			}},
+		},
+		Mount: func(r chi.Router) {
+			identityHandler.RegisterRoutes(r, identity.RouteDeps{
+				RequireAuth: requireAuth,
+				// Applied by the handler to the credential endpoints only, not to the
+				// whole domain.
+				CredentialRateLimit: httpx.AuthRateLimit(redis, cfg.HTTP.TrustedProxy),
+			})
+		},
+	})
+
+	server := &http.Server{
+		Addr:              cfg.HTTP.Addr,
+		Handler:           router,
+		ReadTimeout:       cfg.HTTP.ReadTimeout,
+		WriteTimeout:      cfg.HTTP.WriteTimeout,
+		IdleTimeout:       cfg.HTTP.IdleTimeout,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	metricsServer := startMetricsServer(cfg, log)
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		log.Info("http server listening", slog.String("addr", cfg.HTTP.Addr))
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
+		}
+	}()
+
+	select {
+	case err := <-serverErrors:
+		return fmt.Errorf("http server: %w", err)
+
+	case <-ctx.Done():
+		log.Info("shutdown signal received; draining",
+			slog.Duration("grace", cfg.HTTP.ShutdownTimeout))
+
+		// A fresh context: the signal context is already cancelled, and Shutdown needs
+		// a live one to wait on in-flight requests.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
+		defer cancel()
+
+		if metricsServer != nil {
+			_ = metricsServer.Shutdown(shutdownCtx)
+		}
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			// Close after a failed drain: in-flight requests are abandoned, but the
+			// process must not hang past its termination grace period or the
+			// orchestrator kills it with SIGKILL mid-write.
+			_ = server.Close()
+			return fmt.Errorf("graceful shutdown failed after %s: %w", cfg.HTTP.ShutdownTimeout, err)
+		}
+		log.Info("shutdown complete")
+		return nil
+	}
+}
+
+// buildCipher constructs the column cipher.
+//
+// In development an all-zero key is used when none is configured, so the platform runs
+// with no setup. Config validation makes this impossible in production, where it would
+// be equivalent to storing phone numbers in plaintext.
+func buildCipher(cfg *config.Config, log *slog.Logger) (dataenc.Cipher, error) {
+	if len(cfg.Crypto.DataKeys) == 0 {
+		if cfg.Env.IsProduction() {
+			return nil, errors.New("DATA_ENCRYPTION_KEYS is required")
+		}
+		log.Warn("no DATA_ENCRYPTION_KEYS configured; using a fixed development key — encrypted columns offer no protection")
+		return dataenc.New([]dataenc.Key{{ID: "dev", Material: make([]byte, dataenc.KeyLength)}})
+	}
+
+	keys, err := dataenc.ParseKeys(cfg.Crypto.DataKeys)
+	if err != nil {
+		return nil, fmt.Errorf("data encryption keys: %w", err)
+	}
+	cipher, err := dataenc.New(keys)
+	if err != nil {
+		return nil, fmt.Errorf("data encryption keys: %w", err)
+	}
+	log.Info("column encryption ready",
+		slog.String("primary_key_id", cipher.PrimaryKeyID()),
+		slog.Int("keyring_size", len(keys)),
+	)
+	return cipher, nil
+}
+
+// startMetricsServer exposes Prometheus metrics on a separate port.
+//
+// Separate from the API listener on purpose: metrics must not be reachable through the
+// public ingress, and binding them elsewhere makes that a network policy rather than a
+// routing rule somebody has to remember.
+func startMetricsServer(cfg *config.Config, log *slog.Logger) *http.Server {
+	if !cfg.Telemetry.Enabled || cfg.Telemetry.MetricsAddr == "" {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &http.Server{
+		Addr:              cfg.Telemetry.MetricsAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		log.Info("metrics server listening", slog.String("addr", cfg.Telemetry.MetricsAddr))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// A metrics listener that cannot bind must not stop the API from serving.
+			log.Error("metrics server stopped", slog.Any("error", err))
+		}
+	}()
+
+	return srv
+}

@@ -54,6 +54,18 @@ func Bind(r *http.Request, dst any) error {
 					Message: fmt.Sprintf("expected %s", typeErr.Type.String()),
 				}})
 			}
+			// encoding/json reports an unknown field as a plain error with no typed
+			// form to match on, so the field name has to come out of the message.
+			// Worth the string handling: "unknown field role" is actionable, while
+			// "not valid JSON" sends a client hunting for a syntax error that is not
+			// there.
+			if field, ok := unknownFieldName(err); ok {
+				return apperr.ValidationFields([]apperr.FieldError{{
+					Field:   field,
+					Code:    "unknown_field",
+					Message: "this field is not accepted by this endpoint",
+				}})
+			}
 			return apperr.Validation("malformed_json", "the request body is not valid JSON").WithInternal(err)
 		}
 	}
@@ -64,6 +76,27 @@ func Bind(r *http.Request, dst any) error {
 	}
 
 	return Validate(dst)
+}
+
+// unknownFieldPrefix is the message encoding/json produces for a rejected field. It is
+// matched rather than parsed with a regexp because the format is fixed and a prefix
+// check degrades safely if a future Go release rewords it: the caller simply falls back
+// to the generic malformed-JSON error.
+const unknownFieldPrefix = `json: unknown field "`
+
+// unknownFieldName extracts the field name from an unknown-field decode error.
+func unknownFieldName(err error) (string, bool) {
+	msg := err.Error()
+	start := strings.Index(msg, unknownFieldPrefix)
+	if start < 0 {
+		return "", false
+	}
+	rest := msg[start+len(unknownFieldPrefix):]
+	end := strings.IndexByte(rest, '"')
+	if end <= 0 {
+		return "", false
+	}
+	return rest[:end], true
 }
 
 // Validate runs struct validation and converts failures into field errors.

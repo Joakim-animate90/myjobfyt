@@ -46,6 +46,8 @@ type Config struct {
 	NATS      NATSConfig
 	Storage   StorageConfig
 	Auth      AuthConfig
+	Crypto    CryptoConfig
+	SMTP      SMTPConfig
 	Telemetry TelemetryConfig
 	Worker    WorkerConfig
 }
@@ -143,6 +145,31 @@ type AuthConfig struct {
 	DeletionGraceTTL time.Duration `env:"AUTH_DELETION_GRACE" envDefault:"168h"`
 }
 
+type SMTPConfig struct {
+	Host     string `env:"SMTP_HOST" envDefault:"localhost"`
+	Port     int    `env:"SMTP_PORT" envDefault:"1025"`
+	Username string `env:"SMTP_USERNAME"`
+	Password string `env:"SMTP_PASSWORD"`
+	From     string `env:"SMTP_FROM" envDefault:"no-reply@myjobfyt.local"`
+	FromName string `env:"SMTP_FROM_NAME" envDefault:"MyJobFyt"`
+	// UseTLS requires STARTTLS. Off locally because Mailpit speaks plain SMTP;
+	// production validation forces it on, since verification links and application
+	// emails must not cross the network in the clear.
+	UseTLS bool `env:"SMTP_USE_TLS" envDefault:"false"`
+	// AppBaseURL is the origin used to build links in emails.
+	AppBaseURL string        `env:"APP_BASE_URL" envDefault:"http://localhost:13000"`
+	Timeout    time.Duration `env:"SMTP_TIMEOUT" envDefault:"15s"`
+}
+
+type CryptoConfig struct {
+	// DataKeys is the column-encryption keyring, primary first, each entry in
+	// "id:base64-32-bytes" form. Generate one with `make crypto-key`.
+	//
+	// Several entries allow rotation: new writes use the first key while values
+	// written under an older key stay readable until a re-encryption job has run.
+	DataKeys []string `env:"DATA_ENCRYPTION_KEYS" envSeparator:","`
+}
+
 type TelemetryConfig struct {
 	OTLPEndpoint   string  `env:"OTEL_EXPORTER_OTLP_ENDPOINT"`
 	TraceSampleTat float64 `env:"OTEL_TRACES_SAMPLER_ARG" envDefault:"1.0"`
@@ -202,6 +229,9 @@ func (c *Config) Validate() error {
 	if c.Worker.MaxDeliver < 1 {
 		problems = append(problems, "WORKER_DEFAULT_MAX_DELIVER must be at least 1")
 	}
+	if c.SMTP.Port < 1 || c.SMTP.Port > 65535 {
+		problems = append(problems, "SMTP_PORT must be between 1 and 65535")
+	}
 	if c.Storage.MaxCVBytes < 1024 {
 		problems = append(problems, "STORAGE_MAX_CV_BYTES is implausibly small")
 	}
@@ -233,6 +263,17 @@ func (c *Config) Validate() error {
 		}
 		if c.Storage.AccessKey == "" || c.Storage.SecretKey == "" {
 			problems = append(problems, "storage credentials are required in production")
+		}
+		if !c.SMTP.UseTLS {
+			problems = append(problems, "SMTP_USE_TLS must be true in production")
+		}
+		if !strings.HasPrefix(c.SMTP.AppBaseURL, "https://") {
+			problems = append(problems, "APP_BASE_URL must use https in production")
+		}
+		if len(c.Crypto.DataKeys) == 0 {
+			// Without a key, phone numbers and SMTP passwords would have to be stored
+			// in plaintext. Refuse to start rather than quietly downgrade.
+			problems = append(problems, "DATA_ENCRYPTION_KEYS is required in production")
 		}
 		for _, o := range c.HTTP.CORSOrigins {
 			if o == "*" {
