@@ -1,0 +1,52 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 751 >>
+stream
+BT /F1 11 Tf 50 740 Td 14 TL
+(Joakim Candidate) Tj T*
+(Senior Backend Engineer) Tj T*
+(Nairobi, Kenya) Tj T*
+() Tj T*
+(EXPERIENCE) Tj T*
+(Acme Corporation, Senior Backend Engineer, 2021-2024) Tj T*
+(Built distributed Go services handling 40k requests per second) Tj T*
+(Led the migration from monolith to event-driven architecture) Tj T*
+(Reduced p99 latency from 800ms to 120ms) Tj T*
+() Tj T*
+(Globex Ltd, Backend Engineer, 2019-2021) Tj T*
+(Developed REST and gRPC APIs in Go and Python) Tj T*
+(Owned the PostgreSQL schema and migration tooling) Tj T*
+() Tj T*
+(SKILLS) Tj T*
+(Go, Python, PostgreSQL, Redis, NATS, Kubernetes, Docker, Terraform, AWS) Tj T*
+() Tj T*
+(EDUCATION) Tj T*
+(BSc Computer Science, University of Nairobi, 2015-2019) Tj T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000001043 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1113
+%%EOF
