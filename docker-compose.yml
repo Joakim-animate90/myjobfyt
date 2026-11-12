@@ -115,11 +115,36 @@ services:
     profiles: ["full"]
 
   prometheus:
-    image: prom/prometheus:v3.0.1
+    image: prom/prometheus:v3.1.0
     ports:
       - "19091:9090"
+    # Required on Linux for host.docker.internal to resolve, which is how Prometheus
+    # reaches the API and worker running on the developer's host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+    profiles: ["observability"]
+
+  # NATS's monitoring port serves /varz, /healthz and friends, not Prometheus format,
+  # so scraping nats:8222/metrics returns 404 and left the NATS target permanently down.
+  # This exporter translates the monitoring endpoints into metrics: connections, memory,
+  # subscriptions and server health.
+  #
+  # It does not give us per-stream JetStream depth. 0.15.0 polls /jsz but exports no
+  # stream-level series from it, so dead-letter depth comes from the application's own
+  # myjobfyt_events_dead_letter_depth gauge instead. That is the better source anyway:
+  # it is labelled by our stream names and is what the alert rules use.
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.15.0
+    # -jsz takes streams/consumers/accounts, not "all": an unrecognised value is
+    # accepted silently and simply exports no JetStream metrics at all.
+    command: ["-varz", "-jsz=streams", "-connz", "-routez", "-subz", "http://nats:8222"]
+    ports:
+      - "17777:7777"
+    depends_on:
+      - nats
     profiles: ["observability"]
 
   grafana:

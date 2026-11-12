@@ -9,6 +9,10 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+// dlqStreamName is the dead-letter stream. Named once so the topology and anything
+// observing it cannot drift apart.
+const dlqStreamName = "DLQ"
+
 // StreamSpec describes one stream's desired configuration.
 type StreamSpec struct {
 	Name      string
@@ -88,7 +92,7 @@ func Streams() []StreamSpec {
 			// Dead letters use limits retention so they persist until an operator has
 			// dealt with them. A work-queue policy would delete the evidence as soon
 			// as it was read, which is the opposite of what a dead letter is for.
-			Name:      "DLQ",
+			Name:      dlqStreamName,
 			Subjects:  []string{subjectPrefix + ".dlq.>"},
 			Retention: jetstream.LimitsPolicy,
 			MaxAge:    90 * 24 * time.Hour,

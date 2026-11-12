@@ -1,0 +1,74 @@
+# Alerting rules for MyJobFyt.
+#
+# Each rule states the user-visible harm in its annotations, because an alert whose
+# meaning has to be reconstructed at 3am gets silenced instead of fixed.
+groups:
+  - name: myjobfyt-pipeline
+    interval: 30s
+    rules:
+      # MJF-007: "Dead-letter depth above zero raises an alert."
+      #
+      # Deliberately a depth gauge rather than the arrival counter. dead_lettered_total
+      # only ever increases, so a threshold on it fires permanently after one incident,
+      # and a rate window on it goes quiet while the messages are still sitting there
+      # unexamined. Depth answers the question that matters: is anything still waiting
+      # for a human.
+      - alert: DeadLettersWaiting
+        expr: myjobfyt_events_dead_letter_depth > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} dead-lettered event(s) waiting in {{ $labels.stream }}"
+          description: >-
+            The platform has given up on {{ $value }} event(s) and nothing will process
+            them. For the CV pipeline this is a candidate whose upload is stuck. Inspect
+            with `nats stream view DLQ`; each message carries the consumer, the stage and
+            the failure reason. These are not retried automatically.
+
+      # A stale gauge must not read as "nothing waiting". Without this, a monitor that
+      # stopped would leave DeadLettersWaiting permanently satisfied and silent.
+      - alert: DeadLetterDepthUnknown
+        expr: myjobfyt_events_dead_letter_depth_stale > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dead-letter depth for {{ $labels.stream }} cannot be read"
+          description: >-
+            The depth gauge is not being refreshed, so DeadLettersWaiting cannot be
+            trusted and abandoned work may be accumulating unseen. Usually a lost NATS
+            connection from the worker.
+
+      # The pipeline is a chain of consumers; a stalled one is invisible from the
+      # outside because uploads keep succeeding and simply never progress.
+      - alert: EventProcessingFailing
+        expr: |
+          sum by (consumer) (rate(myjobfyt_events_processed_total{outcome="failure"}[10m]))
+            /
+          sum by (consumer) (rate(myjobfyt_events_processed_total[10m]))
+            > 0.25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.consumer }} is failing more than a quarter of its events"
+          description: >-
+            Sustained failures short of dead-lettering, so nothing has been given up on
+            yet but the stage is not keeping up. Check the dependency the consumer needs:
+            antivirus, the AI provider, the embedding service or SMTP.
+
+      # Embedding degradation is specifically designed to be survivable, which is exactly
+      # why it needs saying out loud: nothing breaks, matches just get quietly worse.
+      - alert: EmbeddingServiceDegraded
+        expr: |
+          sum(rate(myjobfyt_events_processed_total{consumer="cv-embed",outcome="failure"}[15m])) > 0
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "CV embedding has been failing for 30 minutes"
+          description: >-
+            Matching has fallen back to lexical scoring and is marking results degraded.
+            Nothing is lost: the backfill re-embeds affected CVs once the service
+            returns. Candidates processed meanwhile keep weaker scores until then.

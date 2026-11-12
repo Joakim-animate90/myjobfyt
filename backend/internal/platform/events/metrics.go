@@ -44,6 +44,28 @@ var (
 		Help:      "Events sent to a dead-letter subject after exhausting redelivery.",
 	}, []string{"consumer", "event_type", "reason"})
 
+	// eventsDeadLetterDepth is a gauge, not a counter, because the alerting question is
+	// "is anything still sitting unhandled" rather than "how many ever arrived". A
+	// counter cannot answer it: dead_lettered_total stays high for ever after a single
+	// incident, so an alert on it either fires permanently or needs a rate window that
+	// goes quiet while the messages are still there, unexamined.
+	eventsDeadLetterDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "myjobfyt",
+		Subsystem: "events",
+		Name:      "dead_letter_depth",
+		Help:      "Messages currently sitting in a dead-letter stream, awaiting an operator.",
+	}, []string{"stream"})
+
+	// eventsDeadLetterDepthStale reports that the depth gauge could not be refreshed.
+	// Without it, a monitor that silently stopped would leave the depth reading at its
+	// last value and the alert would conclude all was well.
+	eventsDeadLetterDepthStale = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "myjobfyt",
+		Subsystem: "events",
+		Name:      "dead_letter_depth_stale",
+		Help:      "1 when the dead-letter depth could not be read, so the depth gauge is not trustworthy.",
+	}, []string{"stream"})
+
 	eventsDuplicatesDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "myjobfyt",
 		Subsystem: "events",

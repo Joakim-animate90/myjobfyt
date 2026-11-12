@@ -49,6 +49,7 @@ type Repository interface {
 	EmbeddingsForVersion(ctx context.Context, userID, versionID uuid.UUID, model string) ([]StoredEmbedding, error)
 	VersionsNeedingEmbedding(ctx context.Context, model string, limit int) ([]uuid.UUID, error)
 	VersionsWithoutAnyEmbedding(ctx context.Context, limit int) ([]uuid.UUID, error)
+	CandidateEmail(ctx context.Context, userID uuid.UUID) (string, error)
 	EmbeddingInputs(ctx context.Context, versionID uuid.UUID) (EmbeddingInput, error)
 
 	SetLabel(ctx context.Context, userID, documentID uuid.UUID, label string) error
@@ -1262,6 +1263,29 @@ func (r *PostgresRepository) VersionsWithoutAnyEmbedding(ctx context.Context, li
 		return nil, apperr.Internalf(err, "iterate versions without embeddings")
 	}
 	return out, nil
+}
+
+// CandidateEmail returns the address to notify a candidate at.
+//
+// Scoped to a verified, active account: a parse-failure notice sent to an unverified
+// address would be mail to someone who may not own it, and this domain has no business
+// reaching a deleted account.
+func (r *PostgresRepository) CandidateEmail(ctx context.Context, userID uuid.UUID) (string, error) {
+	const q = `
+		SELECT email
+		FROM users
+		WHERE id = $1
+		  AND email_verified_at IS NOT NULL
+		  AND deleted_at IS NULL`
+
+	var email string
+	if err := r.db.Querier(ctx).QueryRow(ctx, q, userID).Scan(&email); err != nil {
+		if postgres.IsNoRows(err) {
+			return "", apperr.NotFound("candidate")
+		}
+		return "", apperr.Internalf(err, "look up candidate email")
+	}
+	return email, nil
 }
 
 // EmbeddingInputs gathers the text a version's vectors are built from.

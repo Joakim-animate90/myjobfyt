@@ -25,6 +25,7 @@ import (
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/docextract"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/embed"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/events"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/mailer"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/postgres"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/redisx"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/storage"
@@ -114,12 +115,24 @@ func run() error {
 
 	// --- consumers ----------------------------------------------------------
 
+	// Without a sender a parse failure is silent to the candidate: the version is
+	// marked failed, the reason is recorded for the API, and nobody tells them. The
+	// logging sender keeps development honest by printing what would have been sent.
+	var emailSender mailer.Sender
+	if cfg.SMTP.Host == "" {
+		emailSender = mailer.NewLoggingSender(log)
+		log.Warn("no SMTP host configured; CV parse-failure notices will be logged rather than sent")
+	} else {
+		emailSender = mailer.NewSMTPSender(cfg.SMTP, log)
+	}
+
 	cvWorker := cv.NewWorker(cv.WorkerDeps{
 		Repo:      cv.NewPostgresRepository(db),
 		Store:     objectStore,
 		Scanner:   scanner,
 		Extractor: extractor,
 		Embedder:  embedder,
+		Notifier:  mailer.NewCVMailer(emailSender, cfg.SMTP.AppBaseURL, log),
 		Bus:       bus,
 		Logger:    log,
 		Limits: docextract.Limits{
@@ -127,6 +140,11 @@ func run() error {
 			MaxChars: cfg.Extract.MaxChars,
 		},
 	})
+
+	if !cvWorker.CandidateNotificationsEnabled() {
+		log.Warn("candidate notifications are DISABLED; a CV that fails to parse will be " +
+			"recorded as failed but the candidate will never be told")
+	}
 
 	registrations, err := worker.Collect(cvWorker)
 	if err != nil {
@@ -173,6 +191,20 @@ func run() error {
 		close(backfillDone)
 	}
 
+	// A dead letter is candidate work the platform has given up on, so "anything is
+	// waiting for a human" has to be observable. The arrival counter cannot answer that
+	// on its own: it only ever increases.
+	dlqMonitorDone := make(chan struct{})
+	go func() {
+		defer close(dlqMonitorDone)
+		monitor := events.NewDeadLetterMonitor(bus.JetStream(), log)
+		if err := monitor.Run(ctx, events.DeadLetterMonitorConfig{
+			Interval: cfg.Worker.DLQPollInterval,
+		}); err != nil {
+			log.Error("dead-letter monitor stopped", slog.Any("error", err))
+		}
+	}()
+
 	metricsServer := startMetricsServer(cfg, log)
 
 	<-ctx.Done()
@@ -187,6 +219,7 @@ func run() error {
 	// The backfill observes the same cancelled context; wait so a sweep in progress
 	// finishes its current version rather than being abandoned mid-write.
 	<-backfillDone
+	<-dlqMonitorDone
 
 	if metricsServer != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

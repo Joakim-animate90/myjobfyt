@@ -238,6 +238,9 @@ type WorkerConfig struct {
 	AckWait     time.Duration `env:"WORKER_DEFAULT_ACK_WAIT" envDefault:"2m"`
 	MaxDeliver  int           `env:"WORKER_DEFAULT_MAX_DELIVER" envDefault:"5"`
 	ShutdownTO  time.Duration `env:"WORKER_SHUTDOWN_TIMEOUT" envDefault:"45s"`
+	// DLQPollInterval is how often the dead-letter depth gauge is refreshed. One
+	// stream-info call per interval, so this is cheap.
+	DLQPollInterval time.Duration `env:"WORKER_DLQ_POLL_INTERVAL" envDefault:"30s"`
 }
 
 // Load reads configuration from the environment and validates it.

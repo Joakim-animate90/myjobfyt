@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/mailer"
 	"io"
 	"log/slog"
 	"strings"
@@ -44,6 +45,15 @@ type Embedder interface {
 	Name() string
 }
 
+// Notifier tells a candidate something about their CV.
+//
+// An interface rather than the mailer directly, so the worker can be tested without an
+// SMTP server and so a future in-app notification channel is a second implementation
+// rather than a change here.
+type Notifier interface {
+	SendParseFailedEmail(ctx context.Context, notice mailer.ParseFailureNotice) error
+}
+
 // ExtractionMeta is what the extractor reports about the call itself, for logging and
 // cost attribution.
 type ExtractionMeta struct {
@@ -60,6 +70,7 @@ type Worker struct {
 	scanner   Scanner
 	extractor Extractor
 	embedder  Embedder
+	notifier  Notifier
 	bus       events.Publisher
 	log       *slog.Logger
 	now       func() time.Time
@@ -83,6 +94,10 @@ type WorkerDeps struct {
 	Extractor Extractor
 	// Embedder may be nil, which leaves matching on the lexical path.
 	Embedder Embedder
+	// Notifier may be nil, in which case a parse failure is recorded and logged but the
+	// candidate is not told. The worker logs that at startup rather than leaving it to
+	// be discovered by a candidate waiting for a CV that will never parse.
+	Notifier Notifier
 	Bus      events.Publisher
 	Logger   *slog.Logger
 	Now      func() time.Time
@@ -105,6 +120,7 @@ func NewWorker(d WorkerDeps) *Worker {
 		scanner:   d.Scanner,
 		extractor: d.Extractor,
 		embedder:  d.Embedder,
+		notifier:  d.Notifier,
 		bus:       d.Bus,
 		log:       d.Logger,
 		now:       now,
@@ -118,6 +134,9 @@ func (w *Worker) StructuredExtractionEnabled() bool { return w.extractor != nil 
 
 // SemanticMatchingEnabled reports whether embeddings will be generated.
 func (w *Worker) SemanticMatchingEnabled() bool { return w.embedder != nil }
+
+// CandidateNotificationsEnabled reports whether parse failures reach the candidate.
+func (w *Worker) CandidateNotificationsEnabled() bool { return w.notifier != nil }
 
 // uploadedPayload is the cv.uploaded event body.
 type uploadedPayload struct {
@@ -182,6 +201,30 @@ func (w *Worker) Registrations() []events.Registration {
 			InFlight:   events.InFlightRetry,
 			AckWait:    2 * time.Minute,
 			MaxDeliver: 4,
+		},
+		{
+			Name:     "cv-notify-parse-failed",
+			Group:    "cv",
+			Stream:   "CV",
+			Subjects: []string{events.SubjectFor(events.TypeCVParseFailed)},
+			Handler:  w.handleParseFailedNotification,
+			IdempotencyKey: func(env *events.Envelope) string {
+				var p parseFailedPayload
+				if err := env.Decode(&p); err != nil {
+					return ""
+				}
+				// Keyed on the stage as well as the version: two different stages can
+				// each fail for a version over its lifetime, and the candidate should
+				// hear about each once rather than only the first.
+				return "cv.notify_failed:" + p.VersionID + ":" + p.Stage
+			},
+			// Sending an email cannot be undone. If a previous attempt claimed this key
+			// and vanished, we do not know whether the message went out, and a duplicate
+			// "we could not process your CV" is worse than a dead letter an operator can
+			// look at.
+			InFlight:   events.InFlightUnknown,
+			AckWait:    1 * time.Minute,
+			MaxDeliver: 3,
 		},
 		{
 			Name:     "cv-skill-normalise",
@@ -1047,4 +1090,77 @@ func (w *Worker) pendingForBackfill(ctx context.Context, batchSize int) ([]uuid.
 		return w.repo.VersionsNeedingEmbedding(ctx, model, batchSize)
 	}
 	return w.repo.VersionsWithoutAnyEmbedding(ctx, batchSize)
+}
+
+// parseFailedPayload is the cv.parse_failed event's body.
+type parseFailedPayload struct {
+	CVID      string `json:"cv_id"`
+	VersionID string `json:"version_id"`
+	UserID    string `json:"user_id"`
+	Reason    string `json:"reason"`
+	Stage     string `json:"stage"`
+}
+
+// handleParseFailedNotification tells the candidate their CV could not be processed.
+//
+// Without this, a failed upload is silent: the version sits in a failed state, the
+// reason is recorded for the API, and the candidate waits for a CV that will never
+// parse. The reason classification exists precisely so the message can be actionable —
+// "this looks like a scanned image" is the difference between a candidate fixing it in
+// a minute and giving up on the product.
+func (w *Worker) handleParseFailedNotification(ctx context.Context, env *events.Envelope) error {
+	if w.notifier == nil {
+		// Acknowledged rather than dead-lettered: running without a mail sender is a
+		// supported development mode, and the startup log already says so.
+		return nil
+	}
+
+	var p parseFailedPayload
+	if err := env.Decode(&p); err != nil {
+		return apperr.Unprocessable("undecodable_payload", "cv.parse_failed payload could not be decoded").
+			WithInternal(err)
+	}
+
+	userID, err := uuid.Parse(p.UserID)
+	if err != nil {
+		return apperr.Unprocessable("invalid_user_id", "cv.parse_failed carried an invalid user id").
+			WithInternal(err)
+	}
+
+	// Logged by id, never by address: the recipient is personal data and this line goes
+	// to the shared log stream.
+	log := w.log.With(
+		slog.String("cv_version_id", p.VersionID),
+		slog.String("stage", p.Stage),
+		slog.String("reason", p.Reason),
+	)
+
+	email, err := w.repo.CandidateEmail(ctx, userID)
+	if err != nil {
+		if apperr.KindOf(err) == apperr.KindNotFound {
+			// Deleted, or never verified their address. Nothing to send, and nothing
+			// wrong: acknowledge rather than retrying forever.
+			log.InfoContext(ctx, "no verified address for this candidate; not sending a parse-failure notice")
+			return nil
+		}
+		return err
+	}
+
+	reason := ParseFailureReason(p.Reason)
+
+	if err := w.notifier.SendParseFailedEmail(ctx, mailer.ParseFailureNotice{
+		To:          email,
+		Explanation: reason.Message(),
+		Retryable:   reason.Retryable(),
+	}); err != nil {
+		// Retryable: the next delivery tries again. Because this consumer uses
+		// InFlightUnknown, an attempt that dies without reporting dead-letters instead
+		// of risking a duplicate.
+		log.WarnContext(ctx, "could not send the parse-failure notice", slog.Any("error", err))
+		return apperr.Dependency("mailer", err)
+	}
+
+	log.InfoContext(ctx, "parse-failure notice sent",
+		slog.Bool("retryable", reason.Retryable()))
+	return nil
 }

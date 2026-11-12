@@ -2,22 +2,34 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
 scrape_configs:
+  # host.docker.internal lets Prometheus in a container scrape the API and worker
+  # running on the developer's host, which is how they are normally run in development.
+  # On Linux this name only resolves because docker-compose.yml maps it to host-gateway.
+  #
+  # The ports are the development stack's remapped ones (default + 10000, matching
+  # METRICS_ADDR and WORKER_METRICS_ADDR in .env.example), not 9090/9092. Pointing at
+  # the defaults meant Prometheus scraped nothing and every alert sat permanently
+  # inactive on absent series, which looks identical to a healthy system.
   - job_name: myjobfyt-api
-    # host.docker.internal lets Prometheus in a container scrape the API running on the
-    # developer's host, which is how the API is normally run during development.
     static_configs:
-      - targets: ["host.docker.internal:9090"]
+      - targets: ["host.docker.internal:19090"]
         labels:
           service: api
 
   - job_name: myjobfyt-worker
     static_configs:
-      - targets: ["host.docker.internal:9092"]
+      - targets: ["host.docker.internal:19092"]
         labels:
           service: worker
 
+  # Scraped through prometheus-nats-exporter, not NATS directly: the NATS monitoring
+  # port serves /varz and returns 404 for /metrics, so pointing this job at nats:8222
+  # left the target permanently down and JetStream depth and consumer lag unobservable.
+  # In-container, so service ports rather than the remapped host ports.
   - job_name: nats
-    metrics_path: /metrics
     static_configs:
-      - targets: ["nats:8222"]
+      - targets: ["nats-exporter:7777"]
