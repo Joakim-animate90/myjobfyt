@@ -12,6 +12,7 @@ import (
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/config"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/jobs"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/jobs/adzuna"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/jobs/remotefeeds"
 )
 
 // BuildRegistry constructs the adapters this deployment has credentials for.
@@ -47,6 +48,19 @@ func BuildRegistry(cfg *config.Config, log *slog.Logger) (*jobs.Registry, error)
 			slog.String("source", adzuna.Slug),
 			slog.String("hint", "set ADZUNA_APP_ID and ADZUNA_APP_KEY"),
 		)
+	}
+
+	// The free feeds need no credentials, so they are always registered. Whether they
+	// are used is the database's decision — see job_sources.state — and whether they
+	// may be used at all is a legal-basis question the executor checks.
+	for _, adapter := range []jobs.Adapter{
+		remotefeeds.NewRemotive(remotefeeds.Config{}),
+		remotefeeds.NewRemoteOK(remotefeeds.Config{}),
+		remotefeeds.NewArbeitnow(remotefeeds.Config{}),
+	} {
+		if err := registry.Register(adapter); err != nil {
+			return nil, err
+		}
 	}
 
 	log.Info("job source registry built", slog.Any("adapters", registry.Slugs()))

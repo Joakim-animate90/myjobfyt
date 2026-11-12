@@ -47,6 +47,18 @@ func NewTokenLimiter(perMinute int) *TokenLimiter {
 	}
 }
 
+// NewIntervalLimiter builds a limiter from a minimum spacing between requests.
+//
+// Needed because some sources ask for a rate slower than one per minute: Remotive's own
+// terms advise at most four requests a day and say excessive requests will be blocked,
+// which a per-minute figure cannot express.
+func NewIntervalLimiter(interval time.Duration) *TokenLimiter {
+	if interval <= 0 {
+		interval = time.Minute / 30
+	}
+	return &TokenLimiter{interval: interval, now: time.Now, sleep: sleepCtx}
+}
+
 // Wait blocks until the next request is due.
 func (l *TokenLimiter) Wait(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {

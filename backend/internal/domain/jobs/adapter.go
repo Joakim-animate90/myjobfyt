@@ -72,6 +72,13 @@ type Capabilities struct {
 	Radius bool
 	// RemoteFilter means filtering to remote roles is supported.
 	RemoteFilter bool
+	// RemoteOnly means every posting from this source is remote, so it cannot serve a
+	// search that requires onsite or hybrid work at all.
+	//
+	// Distinct from RemoteFilter, which means "can narrow to remote". A remote-only
+	// feed asked for onsite roles in Nairobi would return remote jobs worldwide, and
+	// the run would look successful while every result was wrong for the candidate.
+	RemoteOnly bool
 	// WorkModeFilter means filtering by onsite/hybrid/remote is supported.
 	WorkModeFilter bool
 	// EmploymentTypeFilter means filtering by contract type is supported.
@@ -98,6 +105,17 @@ type Capabilities struct {
 // run: "skipped, source cannot filter by salary" is diagnosable, while a missing result
 // is not.
 func (c Capabilities) Supports(spec SearchSpec) (bool, string) {
+	if c.RemoteOnly {
+		// Every posting is remote, so a search that wants onsite or hybrid work cannot
+		// be served by this source at all — not narrowed, not approximated.
+		for _, mode := range spec.WorkModes {
+			switch strings.ToLower(strings.TrimSpace(mode)) {
+			case "onsite", "hybrid":
+				return false, "this source carries only remote roles"
+			}
+		}
+	}
+
 	switch {
 	case len(spec.Keywords) > 0 && !c.Keywords:
 		return false, "the source does not support keyword search"
@@ -107,7 +125,7 @@ func (c Capabilities) Supports(spec SearchSpec) (bool, string) {
 		return false, "the source does not support a search radius"
 	case spec.RemoteOnly && !c.RemoteFilter && !c.WorkModeFilter:
 		return false, "the source cannot filter to remote roles"
-	case len(spec.WorkModes) > 0 && !c.WorkModeFilter:
+	case len(spec.WorkModes) > 0 && !c.WorkModeFilter && !c.RemoteOnly:
 		return false, "the source does not support work-mode filtering"
 	case len(spec.EmploymentTypes) > 0 && !c.EmploymentTypeFilter:
 		return false, "the source does not support employment-type filtering"

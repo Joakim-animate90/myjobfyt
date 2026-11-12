@@ -279,6 +279,41 @@ candidates, and says so only at the point they try to build a CV.
 
 ---
 
+## TD-15 — Remotive's terms may conflict with a signup-gated product
+**Kind:** blocked · **Where:** `job_sources` seed, `internal/domain/jobs/remotefeeds`
+
+Remotive's API returns its terms inside every response. Reading them while building the
+adapter surfaced a clause that bears directly on this product's model:
+
+> Displaying our jobs in order to collect signups/email addresses to show a listing
+> constitutes a breach of our terms of services.
+
+MyJobFyt requires an account before a candidate sees matches. Whether that is "displaying
+jobs in order to collect signups" — the clause plainly targets using someone else's
+listings as bait to harvest email addresses — or simply a product that happens to have
+accounts, is not a judgement an engineer should make silently either way.
+
+The other obligations in the same notice are implemented: `Attribution` travels with
+every posting and is a required field rather than something a UI must remember to look
+up, and the adapter's limiter is set to one request every six hours, matching their
+stated advice of at most four a day.
+
+**Why it is not enabled.** `remotive` stays `disabled` in the seed. The adapter is
+written, conformance-tested and verified against the live feed, so enabling it is a
+one-row change once someone has decided — but that decision needs a person, not a
+default.
+
+**Pay down when:** someone with authority reads the clause and decides. If the answer is
+no, the source should move to `partnership_required` with the reason recorded, which is
+what that state exists for; Remotive offer a paid API for commercial use.
+
+**Risk if ignored:** enabling it on the assumption that it is fine risks losing access —
+their notice says access will be terminated — and, more importantly, means operating
+against a third party's stated terms without having read them. The same clause does not
+appear in Remote OK's or Arbeitnow's terms, so those two are unaffected.
+
+---
+
 ## Summary
 
 | ID | Kind | Priority | Tracked by |
@@ -290,6 +325,7 @@ candidates, and says so only at the point they try to build a CV.
 | TD-06 | shortcut | low | `MJF-070` |
 | TD-07 | deliberate | resolves naturally | `MJF-050` |
 | TD-12 | deliberate | with `MJF-031` | `MJF-031` |
+| TD-15 | blocked | needs a human decision | — |
 | TD-14 | shortcut | before non-Latin launch | — |
 | TD-02, TD-08, TD-09, TD-11, TD-13 | deliberate | threshold-triggered | — |
 | TD-05 | deliberate | never | — |

@@ -46,4 +46,27 @@ type CanonicalPosting struct {
 	PostedAt  *time.Time
 	ApplyURL  string
 	SourceURL string
+
+	// Attribution is how this posting's source must be credited wherever the posting is
+	// shown. Several of the free feeds make this a condition of access — Remotive and
+	// Remote OK both state they will suspend API access without a visible link back and
+	// a named credit — so it travels with the posting rather than being a fact about
+	// the source that a UI has to remember to look up.
+	//
+	// Empty means the source imposes no attribution requirement.
+	Attribution Attribution
 }
+
+// Attribution is a source's required credit.
+type Attribution struct {
+	// SourceName is the name to display, e.g. "Remote OK".
+	SourceName string
+	// SourceURL is the link to follow back. Must be a real followable link where the
+	// terms require one: Remote OK specifies follow rather than nofollow.
+	SourceURL string
+	// NoFollowProhibited is true where the source's terms require a followable link.
+	NoFollowProhibited bool
+}
+
+// Required reports whether this posting must carry a visible credit.
+func (a Attribution) Required() bool { return a.SourceName != "" }
