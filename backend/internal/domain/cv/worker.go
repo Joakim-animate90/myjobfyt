@@ -141,6 +141,25 @@ func (w *Worker) Registrations() []events.Registration {
 			MaxDeliver: 4,
 		},
 		{
+			Name:     "cv-skill-normalise",
+			Group:    "cv",
+			Stream:   "CV",
+			Subjects: []string{events.SubjectFor(events.TypeCVParsed)},
+			Handler:  w.handleParsed,
+			IdempotencyKey: func(env *events.Envelope) string {
+				var p parsedPayload
+				if err := env.Decode(&p); err != nil {
+					return ""
+				}
+				return "cv.skills:" + p.VersionID
+			},
+			// Linking is idempotent: it sets the same skill_id on the same rows, and
+			// never touches a row the candidate owns.
+			InFlight:   events.InFlightRetry,
+			AckWait:    1 * time.Minute,
+			MaxDeliver: 4,
+		},
+		{
 			Name:     "cv-structure",
 			Group:    "cv",
 			Stream:   "CV",
@@ -522,6 +541,87 @@ func (w *Worker) handleTextExtracted(ctx context.Context, env *events.Envelope) 
 		"confidence_avg":   report.AverageConfidence,
 		"unverified_count": report.Unverified,
 	})
+	return nil
+}
+
+// parsedPayload is the cv.parsed event body.
+type parsedPayload struct {
+	CVID       string `json:"cv_id"`
+	VersionID  string `json:"version_id"`
+	UserID     string `json:"user_id"`
+	Structured bool   `json:"structured"`
+	SkillCount int    `json:"skill_count"`
+}
+
+// handleParsed normalises a parsed CV's skills against the canonical taxonomy.
+//
+// A separate stage from extraction rather than part of it, so the CV is usable the
+// moment it is parsed and the canonical links arrive shortly after. Matching is a
+// database lookup, not a model call, so this stage costs nothing and cannot fail for
+// provider reasons.
+func (w *Worker) handleParsed(ctx context.Context, env *events.Envelope) error {
+	var p parsedPayload
+	if err := env.Decode(&p); err != nil {
+		return apperr.Unprocessable("undecodable_payload", "cv.parsed payload could not be decoded").
+			WithInternal(err)
+	}
+
+	// A version parsed on text alone has no skills to normalise.
+	if !p.Structured {
+		return nil
+	}
+
+	versionID, err := uuid.Parse(p.VersionID)
+	if err != nil {
+		return apperr.Unprocessable("invalid_version_id", "cv.parsed carried an invalid version id").
+			WithInternal(err)
+	}
+
+	log := w.log.With(slog.String("cv_version_id", p.VersionID))
+
+	labels, err := w.repo.SkillLabelsForVersion(ctx, versionID)
+	if err != nil {
+		if apperr.KindOf(err) == apperr.KindNotFound {
+			return nil
+		}
+		return err
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+
+	resolved, err := w.repo.MatchSkillLabels(ctx, labels)
+	if err != nil {
+		return err
+	}
+
+	linked, err := w.repo.LinkSkillIDs(ctx, versionID, resolved)
+	if err != nil {
+		return err
+	}
+
+	// Best-effort: losing one triage row costs a little curation signal, while failing
+	// here would cost the candidate their skill links for a bookkeeping problem.
+	if rerr := w.repo.RecordUnmatchedLabels(ctx, resolved); rerr != nil {
+		log.WarnContext(ctx, "unmatched skill labels were not recorded for triage",
+			slog.Any("error", rerr))
+	}
+
+	unmatched := make([]string, 0, len(resolved))
+	for _, skill := range resolved {
+		if !skill.Outcome.Matched() {
+			unmatched = append(unmatched, skill.Normalised)
+		}
+	}
+
+	log.InfoContext(ctx, "cv skills normalised",
+		slog.Int("labels", len(labels)),
+		slog.Int("linked", linked),
+		slog.Int("unmatched", len(unmatched)),
+		// The unmatched labels themselves are safe to log: they are skill names, not
+		// personal data, and seeing them is how the taxonomy gaps get noticed.
+		slog.Any("unmatched_labels", unmatched),
+	)
 	return nil
 }
 

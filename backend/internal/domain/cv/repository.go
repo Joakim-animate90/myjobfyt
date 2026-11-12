@@ -38,6 +38,11 @@ type Repository interface {
 	SkillsByVersion(ctx context.Context, userID, versionID uuid.UUID) ([]Skill, error)
 	RecordCorrection(ctx context.Context, userID, versionID uuid.UUID, field string) error
 
+	MatchSkillLabels(ctx context.Context, labels []string) ([]NormalisedSkill, error)
+	RecordUnmatchedLabels(ctx context.Context, labels []NormalisedSkill) error
+	LinkSkillIDs(ctx context.Context, versionID uuid.UUID, resolved []NormalisedSkill) (int, error)
+	SkillLabelsForVersion(ctx context.Context, versionID uuid.UUID) ([]string, error)
+
 	SetLabel(ctx context.Context, userID, documentID uuid.UUID, label string) error
 	SetDefault(ctx context.Context, userID, documentID uuid.UUID) error
 	SoftDeleteDocument(ctx context.Context, userID, documentID uuid.UUID) error
@@ -877,4 +882,174 @@ func (r *PostgresRepository) RawText(ctx context.Context, versionID uuid.UUID) (
 		return "", apperr.Internalf(err, "select cv raw text")
 	}
 	return text, nil
+}
+
+// --- skill taxonomy ---------------------------------------------------------
+
+// MatchSkillLabels resolves raw labels against the canonical taxonomy.
+//
+// One query for the whole batch rather than one per label: a CV with 40 skills should
+// not be 40 round trips. The lookup is a single array containment check against the
+// gin index on aliases, which holds the canonical name as well as the synonyms — so
+// there is no separate canonical-versus-alias query.
+//
+// Labels that match nothing come back with a nil Skill. They are not dropped: the
+// candidate wrote them and may recognise them even when the taxonomy does not.
+func (r *PostgresRepository) MatchSkillLabels(ctx context.Context, labels []string) ([]NormalisedSkill, error) {
+	out := make([]NormalisedSkill, 0, len(labels))
+	if len(labels) == 0 {
+		return out, nil
+	}
+
+	normalised := make([]string, 0, len(labels))
+	for _, label := range labels {
+		normalised = append(normalised, NormaliseLabel(label))
+	}
+
+	const q = `
+		SELECT n.normalised, s.id, s.canonical_name, coalesce(s.category, ''),
+		       (s.canonical_name IS NOT NULL
+		        AND normalise_skill_label(s.canonical_name) = n.normalised) AS is_canonical
+		FROM unnest($1::text[]) AS n(normalised)
+		LEFT JOIN skills s ON n.normalised = ANY(s.aliases)`
+
+	rows, err := r.db.Querier(ctx).Query(ctx, q, normalised)
+	if err != nil {
+		return nil, apperr.Internalf(err, "match skill labels")
+	}
+	defer rows.Close()
+
+	// Keyed by normalised form so the result can be re-associated with the original
+	// spellings, which is what gets stored.
+	matches := make(map[string]*TaxonomySkill, len(labels))
+	canonical := make(map[string]bool, len(labels))
+
+	for rows.Next() {
+		var (
+			key         string
+			id          *string
+			name        *string
+			category    string
+			isCanonical *bool
+		)
+		if err := rows.Scan(&key, &id, &name, &category, &isCanonical); err != nil {
+			return nil, apperr.Internalf(err, "scan skill match")
+		}
+		if id != nil && name != nil {
+			matches[key] = &TaxonomySkill{ID: *id, CanonicalName: *name, Category: category}
+			canonical[key] = isCanonical != nil && *isCanonical
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internalf(err, "iterate skill matches")
+	}
+
+	for i, label := range labels {
+		key := normalised[i]
+		resolved := NormalisedSkill{
+			RawLabel:   label,
+			Normalised: key,
+			Outcome:    Unmatched,
+		}
+		if skill, found := matches[key]; found {
+			resolved.Skill = skill
+			if canonical[key] {
+				resolved.Outcome = MatchedCanonical
+			} else {
+				resolved.Outcome = MatchedAlias
+			}
+		}
+		out = append(out, resolved)
+	}
+	return out, nil
+}
+
+// RecordUnmatchedLabels adds labels the taxonomy does not know to the triage list.
+//
+// This is the feedback loop that replaces fuzzy matching. Without it the taxonomy would
+// only grow by guesswork; with it, an operator can see that 400 candidates wrote a
+// label and add the alias, instead of inventing a similarity threshold.
+//
+// Best-effort by design: a failure here must not fail a CV extraction. Losing one
+// triage row costs a little curation signal; failing the extraction costs the candidate
+// their profile.
+func (r *PostgresRepository) RecordUnmatchedLabels(ctx context.Context, labels []NormalisedSkill) error {
+	pending := make([]NormalisedSkill, 0, len(labels))
+	for _, label := range labels {
+		if label.Outcome == Unmatched && label.Normalised != "" {
+			pending = append(pending, label)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	const q = `
+		INSERT INTO unmatched_skill_labels (normalised, sample_label)
+		VALUES ($1, $2)
+		ON CONFLICT (normalised) DO UPDATE
+		SET occurrences  = unmatched_skill_labels.occurrences + 1,
+		    last_seen_at = now()`
+
+	for _, label := range pending {
+		if _, err := r.db.Querier(ctx).Exec(ctx, q, label.Normalised, label.RawLabel); err != nil {
+			return apperr.Internalf(err, "record unmatched skill label")
+		}
+	}
+	return nil
+}
+
+// LinkSkillIDs attaches resolved canonical skills to a version's stored skill rows.
+//
+// Run after matching rather than during the initial insert, because extraction and
+// normalisation are separate pipeline stages: the skills are persisted as soon as they
+// are extracted, so the CV is usable immediately, and the canonical links are filled in
+// when normalisation runs.
+func (r *PostgresRepository) LinkSkillIDs(ctx context.Context, versionID uuid.UUID, resolved []NormalisedSkill) (int, error) {
+	const q = `
+		UPDATE cv_skills
+		SET skill_id = $3
+		WHERE cv_version_id = $1 AND raw_label = $2
+		  -- Never overwrite a link the candidate set. Their correction is authoritative.
+		  AND source <> 'candidate'`
+
+	linked := 0
+	for _, skill := range resolved {
+		if skill.Skill == nil {
+			continue
+		}
+		tag, err := r.db.Querier(ctx).Exec(ctx, q, versionID, skill.RawLabel, skill.Skill.ID)
+		if err != nil {
+			return linked, apperr.Internalf(err, "link skill %q", skill.RawLabel)
+		}
+		linked += int(tag.RowsAffected())
+	}
+	return linked, nil
+}
+
+// SkillLabelsForVersion returns a version's raw skill labels, for normalisation.
+func (r *PostgresRepository) SkillLabelsForVersion(ctx context.Context, versionID uuid.UUID) ([]string, error) {
+	const q = `
+		SELECT raw_label FROM cv_skills
+		WHERE cv_version_id = $1 AND source <> 'candidate'
+		ORDER BY raw_label`
+
+	rows, err := r.db.Querier(ctx).Query(ctx, q, versionID)
+	if err != nil {
+		return nil, apperr.Internalf(err, "list skill labels")
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			return nil, apperr.Internalf(err, "scan skill label")
+		}
+		out = append(out, label)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internalf(err, "iterate skill labels")
+	}
+	return out, nil
 }
