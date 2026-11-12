@@ -17,6 +17,7 @@ import (
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/entitlements"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/identity"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/httpx"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/ai"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/dataenc"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/events"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/mailer"
@@ -165,6 +166,18 @@ func run() error {
 	})
 	cvHandler := cv.NewHandler(cvService, cfg.Storage.MaxCVBytes, log)
 
+	// Tailoring is the only CV feature that needs the AI provider on the request path.
+	// A nil service disables its route rather than failing the whole API, so every
+	// other CV operation keeps working without credentials.
+	tailoringService, err := buildTailoringService(ctx, cfg, db, log)
+	if err != nil {
+		return err
+	}
+	tailoringHandler := cv.NewTailoringHandler(tailoringService, log)
+	if tailoringService == nil {
+		log.Warn("CV tailoring is DISABLED (AI_ENABLED=false); the tailor endpoint will refuse requests")
+	}
+
 	// --- http ---------------------------------------------------------------
 
 	requireAuth := httpx.RequireAuth(identityHandler, identity.AudienceAPI)
@@ -192,6 +205,7 @@ func run() error {
 				CredentialRateLimit: httpx.AuthRateLimit(redis, cfg.HTTP.TrustedProxy),
 			})
 			cvHandler.RegisterRoutes(r, requireAuth)
+			tailoringHandler.RegisterRoutes(r, requireAuth)
 		},
 	})
 
@@ -302,4 +316,54 @@ func startMetricsServer(cfg *config.Config, log *slog.Logger) *http.Server {
 	}()
 
 	return srv
+}
+
+// buildTailoringService constructs the CV tailoring service, or nil when AI is off.
+//
+// Mirrors the worker's buildExtractor: the provider is pinged at boot rather than on
+// the first request, because an API that starts healthy and then fails every tailoring
+// attempt is far harder to diagnose than one that says so at startup.
+func buildTailoringService(ctx context.Context, cfg *config.Config, db *postgres.DB, log *slog.Logger) (*cv.TailoringService, error) {
+	if !cfg.AI.Enabled {
+		if cfg.Env.IsProduction() {
+			return nil, errors.New("AI_ENABLED must be true in production")
+		}
+		return nil, nil
+	}
+
+	provider := ai.NewAnthropicProvider(ai.AnthropicConfig{
+		APIKey:     cfg.AI.APIKey,
+		BaseURL:    cfg.AI.BaseURL,
+		MaxRetries: cfg.AI.MaxRetries,
+	})
+
+	pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := provider.Ping(pingCtx); err != nil {
+		return nil, fmt.Errorf("ai provider is not reachable: %w", err)
+	}
+
+	redis, err := redisx.Open(ctx, cfg.Redis)
+	if err != nil {
+		return nil, fmt.Errorf("redis (needed for AI token quotas): %w", err)
+	}
+
+	accountant := entitlements.NewTokenAccountant(
+		entitlements.NewService(entitlements.NewPostgresRepository(db), redis, log, nil),
+		log,
+	)
+
+	client := ai.NewClient(ai.ClientDeps{
+		Provider:   provider,
+		Accountant: accountant,
+		Logger:     log,
+	})
+
+	log.Info("CV tailoring enabled", slog.String("provider", provider.Name()))
+
+	return cv.NewTailoringService(
+		cv.NewPostgresRepository(db),
+		cv.NewAITailorer(client, cv.TailorerConfig{}),
+		log,
+	), nil
 }
