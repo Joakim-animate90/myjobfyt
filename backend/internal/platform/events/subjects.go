@@ -90,7 +90,32 @@ func DomainOf(eventType string) string {
 	return eventType
 }
 
+// UnknownDomain is the dead-letter domain for a message whose own domain cannot be
+// determined.
+//
+// It exists so a dead-letter subject always has a domain token. "myjobfyt.dlq." matches
+// no stream — the DLQ filter is "myjobfyt.dlq.>", and ">" requires at least one token —
+// so publishing there fails with "no response from stream" and the dead letter is lost.
+const UnknownDomain = "unknown"
+
 // DeadLetterSubject returns the dead-letter subject for an event type's domain.
 func DeadLetterSubject(eventType string) string {
-	return fmt.Sprintf("%s.dlq.%s", subjectPrefix, DomainOf(eventType))
+	return DeadLetterSubjectForDomain(DomainOf(eventType), "")
+}
+
+// DeadLetterSubjectForDomain returns the dead-letter subject for a domain, falling back
+// to a caller-supplied domain and finally to UnknownDomain.
+//
+// The fallback matters because the consumer knows which domain it serves even when the
+// message does not: a message that is valid JSON but not an envelope has no type at
+// all, and routing its dead letter by the consumer's group puts it in front of the
+// right people.
+func DeadLetterSubjectForDomain(domain, fallback string) string {
+	if domain == "" {
+		domain = fallback
+	}
+	if domain == "" {
+		domain = UnknownDomain
+	}
+	return fmt.Sprintf("%s.dlq.%s", subjectPrefix, domain)
 }

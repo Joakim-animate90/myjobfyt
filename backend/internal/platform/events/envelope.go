@@ -100,3 +100,25 @@ func (e *Envelope) DerivedMeta() Meta {
 		// stage that caused it.
 	}
 }
+
+// ValidateShape reports whether this decoded value is actually an envelope.
+//
+// json.Unmarshal into a struct succeeds for any JSON object, so a message that is valid
+// JSON but not an envelope — a producer with a stale schema, something hand-published
+// during an incident — decodes into a struct with every field empty and no error. It
+// then flows through the pipeline with no type, and the dead-letter subject derived
+// from that empty type has an empty domain token, which matches no stream: the message
+// is terminated and its dead letter silently dropped.
+//
+// Type is the field that must be present: it selects the subject, the domain and the
+// dead-letter queue. EventID is required too, because it is the idempotency and
+// causation identity — without it a redelivery cannot be recognised as one.
+func (e *Envelope) ValidateShape() error {
+	switch {
+	case e.Type == "":
+		return fmt.Errorf("envelope has no type; this is not a MyJobFyt event")
+	case e.EventID == "":
+		return fmt.Errorf("envelope %q has no event id", e.Type)
+	}
+	return nil
+}

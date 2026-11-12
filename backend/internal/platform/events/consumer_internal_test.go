@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -603,8 +604,73 @@ func TestUndecodableMessageIsDeadLetteredWithItsRawBody(t *testing.T) {
 	if dls[0].body["raw"] != "{not json" {
 		t.Errorf("raw body = %v, want the original payload preserved for diagnosis", dls[0].body["raw"])
 	}
-	if dls[0].subject != "myjobfyt.dlq.unknown" {
-		t.Errorf("subject = %q, want myjobfyt.dlq.unknown", dls[0].subject)
+	// Routed by the consumer's own group, not to a generic bucket. The message could
+	// not say which domain it belonged to, but the consumer that rejected it knows, and
+	// a dlq.unknown queue is one nobody owns and no domain alert covers.
+	if dls[0].subject != "myjobfyt.dlq.cv" {
+		t.Errorf("subject = %q, want myjobfyt.dlq.cv (the rejecting consumer's domain)",
+			dls[0].subject)
+	}
+}
+
+func TestADeadLetterSubjectAlwaysHasADomainToken(t *testing.T) {
+	// "myjobfyt.dlq." matches no stream: the DLQ filter is "myjobfyt.dlq.>" and ">"
+	// requires at least one token. Publishing there fails with "no response from
+	// stream" and the dead letter is lost — so the messages most needing an operator
+	// would be exactly the ones silently thrown away. Observed live before this guard.
+	cases := map[string]string{
+		"no domain, no fallback":   DeadLetterSubjectForDomain("", ""),
+		"no domain, with fallback": DeadLetterSubjectForDomain("", "cv"),
+		"empty event type":         DeadLetterSubject(""),
+		"typeless but known group": DeadLetterSubjectForDomain(DomainOf(""), "applications"),
+	}
+	for name, subject := range cases {
+		if strings.HasSuffix(subject, ".") {
+			t.Errorf("%s: subject %q ends with an empty token and matches no stream", name, subject)
+		}
+		if subject == subjectPrefix+".dlq." {
+			t.Errorf("%s: subject is the unroutable %q", name, subject)
+		}
+	}
+
+	// The fallback is used when the message cannot name its own domain.
+	if got := DeadLetterSubjectForDomain("", "cv"); got != "myjobfyt.dlq.cv" {
+		t.Errorf("subject = %q, want the fallback domain to be used", got)
+	}
+	// And the message's own domain wins when it has one.
+	if got := DeadLetterSubjectForDomain("jobs", "cv"); got != "myjobfyt.dlq.jobs" {
+		t.Errorf("subject = %q, want the message's own domain to win", got)
+	}
+}
+
+func TestAnEnvelopeShapedLikeJSONButNotAnEventIsRejected(t *testing.T) {
+	// json.Unmarshal into a struct succeeds for any JSON object, so a producer with a
+	// stale schema yields an envelope with every field empty and no error. It would
+	// otherwise flow on with no type and derive an unroutable dead-letter subject.
+	cases := map[string]string{
+		"not an envelope": `{"not":"an envelope"}`,
+		"empty object":    `{}`,
+		"type but no id":  `{"type":"cv.uploaded"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			var env Envelope
+			if err := json.Unmarshal([]byte(body), &env); err != nil {
+				t.Fatalf("fixture is not valid JSON: %v", err)
+			}
+			if err := env.ValidateShape(); err == nil {
+				t.Error("ValidateShape accepted a value that is not an event")
+			}
+		})
+	}
+
+	// A real envelope still passes.
+	good, err := NewEnvelope(TypeCVUploaded, 1, Meta{}, map[string]string{"cv_id": "x"})
+	if err != nil {
+		t.Fatalf("NewEnvelope: %v", err)
+	}
+	if err := good.ValidateShape(); err != nil {
+		t.Errorf("ValidateShape rejected a real envelope: %v", err)
 	}
 }
 

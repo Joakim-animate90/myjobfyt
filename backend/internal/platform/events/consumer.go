@@ -215,13 +215,26 @@ func (rt *Runtime) startOne(ctx context.Context, reg Registration) error {
 // handle processes one delivery: decode, trace, claim, run, ack.
 func (rt *Runtime) handle(parent context.Context, reg Registration, msg jetstream.Msg) {
 	var env Envelope
-	if err := json.Unmarshal(msg.Data(), &env); err != nil {
+	err := json.Unmarshal(msg.Data(), &env)
+	if err == nil {
+		// Decoding into a struct succeeds for any JSON object, so valid JSON that is
+		// not an envelope — a producer with a stale schema, a hand-published message —
+		// arrives here as an envelope with every field empty. Without this check it
+		// proceeds with no type, and the dead-letter subject it eventually derives has
+		// an empty domain token, which matches no stream: the message is terminated and
+		// the dead letter silently discarded. Precisely the payloads most needing an
+		// operator would be the ones thrown away.
+		err = env.ValidateShape()
+	}
+	if err != nil {
 		// An undecodable message can never succeed, so retrying is pure waste.
 		rt.log.Error("undecodable event; dead-lettering",
 			slog.String("consumer", reg.Name),
 			slog.String("subject", msg.Subject()),
 			slog.Any("error", err),
 		)
+		// Passed as nil so the raw body is preserved on the dead letter and the subject
+		// falls back to the unknown queue.
 		rt.deadLetter(parent, reg, msg, nil, "undecodable", err)
 		return
 	}
@@ -422,9 +435,13 @@ func (rt *Runtime) nak(ctx context.Context, msg jetstream.Msg, deliveries uint64
 // deadLetter republishes the message to its domain's dead-letter subject and
 // terminates the delivery so JetStream stops retrying it.
 func (rt *Runtime) deadLetter(ctx context.Context, reg Registration, msg jetstream.Msg, env *Envelope, reason string, cause error) {
-	eventType := "unknown"
+	// The metric label and the routing domain are deliberately separate. The label
+	// wants a readable placeholder; the subject must not inherit it, or every typeless
+	// message lands in a dlq.unknown bucket that no team owns and no domain alert
+	// covers, when the consumer that rejected it knew its domain all along.
+	eventType, domain := "unknown", ""
 	if env != nil {
-		eventType = env.Type
+		eventType, domain = env.Type, DomainOf(env.Type)
 	}
 	eventsDeadLettered.WithLabelValues(reg.Name, eventType, reason).Inc()
 
@@ -449,10 +466,10 @@ func (rt *Runtime) deadLetter(ctx context.Context, reg Registration, msg jetstre
 		record["raw"] = string(msg.Data())
 	}
 
-	subject := DeadLetterSubject(eventType)
-	if env == nil {
-		subject = subjectPrefix + ".dlq.unknown"
-	}
+	// The consumer knows its own domain even when the message does not, so a dead
+	// letter from a decodable-but-typeless message still reaches the right queue rather
+	// than a generic bucket.
+	subject := DeadLetterSubjectForDomain(domain, reg.Group)
 
 	body, err := json.Marshal(record)
 	switch {
