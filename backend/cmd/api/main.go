@@ -179,6 +179,9 @@ func run() error {
 	// The checker always works: the deterministic rubric needs no provider, and the
 	// report states which categories the model pass would have supplied.
 	checkHandler := cv.NewCheckHandler(buildCheckService(aiClient, cfg, db, redis, log), log)
+	// The builder needs no AI and no provider: it renders typed content to PDF in
+	// process, so it is always available.
+	builderHandler := cv.NewBuilderHandler(cv.NewPostgresRepository(db), log)
 	if tailoringService == nil {
 		log.Warn("CV tailoring is DISABLED (AI_ENABLED=false); the tailor endpoint will refuse requests")
 	}
@@ -212,6 +215,7 @@ func run() error {
 			cvHandler.RegisterRoutes(r, requireAuth)
 			tailoringHandler.RegisterRoutes(r, requireAuth)
 			checkHandler.RegisterRoutes(r, requireAuth)
+			builderHandler.RegisterRoutes(r, requireAuth)
 		},
 	})
 
