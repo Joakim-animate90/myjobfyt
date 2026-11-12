@@ -95,10 +95,40 @@ func fabricatedTailoring() cv.TailoredCV {
 	return out
 }
 
+// memoryProposals is an in-memory ProposalStore.
+type memoryProposals struct {
+	saved   map[uuid.UUID]cv.TailoringProposal
+	deleted []uuid.UUID
+}
+
+func newMemoryProposals() *memoryProposals {
+	return &memoryProposals{saved: map[uuid.UUID]cv.TailoringProposal{}}
+}
+
+func (m *memoryProposals) Save(_ context.Context, p cv.TailoringProposal) error {
+	m.saved[p.ID] = p
+	return nil
+}
+
+func (m *memoryProposals) Load(_ context.Context, userID, id uuid.UUID) (cv.TailoringProposal, error) {
+	p, ok := m.saved[id]
+	if !ok || p.UserID != userID {
+		return cv.TailoringProposal{}, apperr.NotFound("tailoring proposal")
+	}
+	return p, nil
+}
+
+func (m *memoryProposals) Delete(_ context.Context, _, id uuid.UUID) error {
+	m.deleted = append(m.deleted, id)
+	delete(m.saved, id)
+	return nil
+}
+
 func newTailoringService(t *testing.T, tailorer cv.Tailorer) *cv.TailoringService {
 	t.Helper()
 	repo := &tailorRepo{source: containmentSource(), skills: sourceSkillSet()}
-	return cv.NewTailoringService(repo, tailorer, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return cv.NewTailoringService(repo, tailorer, newMemoryProposals(),
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func TestHonestTailoringIsReturnedWithItsDiff(t *testing.T) {
@@ -243,7 +273,7 @@ func TestTailoringRequiresAParsedSource(t *testing.T) {
 	// tailoring must not proceed.
 	repo := &tailorRepo{err: apperr.NotFound("parsed CV data")}
 	svc := cv.NewTailoringService(repo, &scriptedTailorer{outputs: []cv.TailoredCV{honestTailoring()}},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		newMemoryProposals(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	outcome, err := svc.TailorForJob(context.Background(), uuid.New(), uuid.New(), "anything")
 	if apperr.KindOf(err) != apperr.KindNotFound {
@@ -305,5 +335,227 @@ func TestAReportedInjectionDoesNotLeakIntoLogsOrOutput(t *testing.T) {
 	}
 	if outcome.Meta.InjectionAttempt == "" {
 		t.Error("the injection attempt was not recorded; it is evidence of an attack on this application")
+	}
+}
+
+// acceptRepo serves a source CV and records what was stored.
+type acceptRepo struct {
+	cv.Repository
+	source  *cv.ParsedData
+	skills  []cv.Skill
+	version *cv.Version
+	stored  *cv.Version
+}
+
+func (r *acceptRepo) ParsedDataByVersion(context.Context, uuid.UUID, uuid.UUID) (*cv.ParsedData, error) {
+	return r.source, nil
+}
+func (r *acceptRepo) SkillsByVersion(context.Context, uuid.UUID, uuid.UUID) ([]cv.Skill, error) {
+	return r.skills, nil
+}
+func (r *acceptRepo) VersionByID(context.Context, uuid.UUID, uuid.UUID) (*cv.Version, error) {
+	return r.version, nil
+}
+func (r *acceptRepo) StoreTailoredVersion(_ context.Context, v *cv.Version, _ *cv.ParsedData, _ []cv.Skill) error {
+	r.stored = v
+	return nil
+}
+
+func newAcceptService(t *testing.T, repo *acceptRepo, proposals cv.ProposalStore) *cv.TailoringService {
+	t.Helper()
+	return cv.NewTailoringService(repo, &scriptedTailorer{outputs: []cv.TailoredCV{honestTailoring()}},
+		proposals, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func TestAcceptStoresTheApprovedTailoringWithItsVerdict(t *testing.T) {
+	repo := &acceptRepo{
+		source: containmentSource(), skills: sourceSkillSet(),
+		version: &cv.Version{ID: uuid.New(), DocumentID: uuid.New()},
+	}
+	proposals := newMemoryProposals()
+	svc := newAcceptService(t, repo, proposals)
+	userID := uuid.New()
+	sourceID := uuid.New()
+	postingID := uuid.New()
+
+	proposal := cv.TailoringProposal{
+		ID: uuid.New(), UserID: userID, SourceID: sourceID, JobPostingID: postingID,
+		Tailored: honestTailoring().ToParsedData(),
+	}
+	if err := proposals.Save(context.Background(), proposal); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	version, err := svc.Accept(context.Background(), userID, proposal.ID)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	if repo.stored == nil {
+		t.Fatal("nothing was stored")
+	}
+	if version.ContainmentPassed == nil || !*version.ContainmentPassed {
+		t.Error("the stored version does not record a passing containment verdict")
+	}
+	if version.DerivedFromVersionID == nil || *version.DerivedFromVersionID != sourceID {
+		t.Error("the stored version does not record the CV it came from")
+	}
+	if version.TailoredForJobPostingID == nil || *version.TailoredForJobPostingID != postingID {
+		t.Error("the stored version does not record the posting it was tailored for")
+	}
+	// The proposal is single-use: accepting it twice would create two identical versions.
+	if len(proposals.deleted) != 1 {
+		t.Errorf("the accepted proposal was not cleared: %v", proposals.deleted)
+	}
+}
+
+func TestAcceptRevalidatesRatherThanTrustingThePreview(t *testing.T) {
+	// The decisive property. Even a proposal that was validated at preview time — or
+	// one that was tampered with afterwards — is re-checked against the current source.
+	// The gate is the check, never a flag someone set earlier.
+	fabricated := fabricatedTailoring().ToParsedData()
+
+	repo := &acceptRepo{
+		source: containmentSource(), skills: sourceSkillSet(),
+		version: &cv.Version{ID: uuid.New(), DocumentID: uuid.New()},
+	}
+	proposals := newMemoryProposals()
+	svc := newAcceptService(t, repo, proposals)
+	userID := uuid.New()
+
+	proposal := cv.TailoringProposal{
+		ID: uuid.New(), UserID: userID, SourceID: uuid.New(), JobPostingID: uuid.New(),
+		Tailored: fabricated,
+	}
+	if err := proposals.Save(context.Background(), proposal); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	_, err := svc.Accept(context.Background(), userID, proposal.ID)
+	if err == nil {
+		t.Fatal("a tampered proposal was stored as the candidate's CV")
+	}
+	if !errors.Is(err, cv.ErrTailoringUnsafe) {
+		t.Errorf("err = %v, want the unsafe-tailoring refusal", err)
+	}
+	if repo.stored != nil {
+		t.Fatal("the fabricated version was written despite the refusal")
+	}
+}
+
+func TestAcceptRefusesWhenTheSourceChangedUnderTheProposal(t *testing.T) {
+	// The candidate corrected their CV between preview and accept. A verdict reached
+	// against the old facts is not a verdict about what is now being stored.
+	narrowedSource := containmentSource()
+	narrowedSource.Certifications = nil // they removed the certification
+
+	repo := &acceptRepo{
+		source: narrowedSource, skills: sourceSkillSet(),
+		version: &cv.Version{ID: uuid.New(), DocumentID: uuid.New()},
+	}
+	proposals := newMemoryProposals()
+	svc := newAcceptService(t, repo, proposals)
+	userID := uuid.New()
+
+	// The proposal still lists the certification, which was true when it was made.
+	proposal := cv.TailoringProposal{
+		ID: uuid.New(), UserID: userID, SourceID: uuid.New(), JobPostingID: uuid.New(),
+		Tailored: honestTailoring().ToParsedData(),
+	}
+	if err := proposals.Save(context.Background(), proposal); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if _, err := svc.Accept(context.Background(), userID, proposal.ID); err == nil {
+		t.Fatal("a tailoring was stored claiming a certification the candidate has since removed")
+	}
+	if repo.stored != nil {
+		t.Error("the version was written despite the refusal")
+	}
+}
+
+func TestAProposalCannotBeAcceptedByAnotherCandidate(t *testing.T) {
+	repo := &acceptRepo{
+		source: containmentSource(), skills: sourceSkillSet(),
+		version: &cv.Version{ID: uuid.New(), DocumentID: uuid.New()},
+	}
+	proposals := newMemoryProposals()
+	svc := newAcceptService(t, repo, proposals)
+
+	owner := uuid.New()
+	proposal := cv.TailoringProposal{
+		ID: uuid.New(), UserID: owner, SourceID: uuid.New(), JobPostingID: uuid.New(),
+		Tailored: honestTailoring().ToParsedData(),
+	}
+	if err := proposals.Save(context.Background(), proposal); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	_, err := svc.Accept(context.Background(), uuid.New(), proposal.ID)
+	if apperr.KindOf(err) != apperr.KindNotFound {
+		t.Fatalf("err = %v (kind %v), want not found", err, apperr.KindOf(err))
+	}
+	if repo.stored != nil {
+		t.Fatal("another candidate's proposal was stored")
+	}
+}
+
+func TestAcceptWithoutAProposalStoreIsUnavailableNotSilent(t *testing.T) {
+	// Running without the store leaves preview working and accept unavailable. It must
+	// say so rather than appear to succeed.
+	repo := &acceptRepo{source: containmentSource(), skills: sourceSkillSet()}
+	svc := cv.NewTailoringService(repo, &scriptedTailorer{outputs: []cv.TailoredCV{honestTailoring()}},
+		nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if _, err := svc.Accept(context.Background(), uuid.New(), uuid.New()); err == nil {
+		t.Fatal("Accept succeeded with no proposal store")
+	}
+	if repo.stored != nil {
+		t.Error("a version was stored with no proposal store")
+	}
+}
+
+func TestPreviewRecordsAProposalForLaterAcceptance(t *testing.T) {
+	repo := &tailorRepo{source: containmentSource(), skills: sourceSkillSet()}
+	proposals := newMemoryProposals()
+	svc := cv.NewTailoringService(repo, &scriptedTailorer{outputs: []cv.TailoredCV{honestTailoring()}},
+		proposals, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	userID, versionID, postingID := uuid.New(), uuid.New(), uuid.New()
+	outcome, proposalID, err := svc.Preview(context.Background(), userID, versionID, postingID, "a job")
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if proposalID == uuid.Nil {
+		t.Fatal("no proposal id returned, so the preview cannot be accepted")
+	}
+	if outcome.Tailored == nil {
+		t.Fatal("no tailored CV returned")
+	}
+
+	saved, ok := proposals.saved[proposalID]
+	if !ok {
+		t.Fatal("the proposal was not recorded")
+	}
+	if saved.UserID != userID || saved.SourceID != versionID || saved.JobPostingID != postingID {
+		t.Errorf("the proposal does not record its provenance: %+v", saved)
+	}
+}
+
+func TestARefusedPreviewRecordsNoProposal(t *testing.T) {
+	// There must be nothing to accept when the platform refused to tailor.
+	repo := &tailorRepo{source: containmentSource(), skills: sourceSkillSet()}
+	proposals := newMemoryProposals()
+	svc := cv.NewTailoringService(repo, &scriptedTailorer{outputs: []cv.TailoredCV{fabricatedTailoring()}},
+		proposals, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, proposalID, err := svc.Preview(context.Background(), uuid.New(), uuid.New(), uuid.New(), "a job")
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	if proposalID != uuid.Nil {
+		t.Error("a proposal id was returned for a refused tailoring")
+	}
+	if len(proposals.saved) != 0 {
+		t.Errorf("%d proposals were recorded for a refused tailoring", len(proposals.saved))
 	}
 }

@@ -3,6 +3,7 @@ package cv
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/apperr"
 	"github.com/google/uuid"
@@ -29,18 +30,24 @@ type TailoringOutcome struct {
 
 // TailoringService turns a job description into a tailored CV, or refuses.
 type TailoringService struct {
-	repo    Repository
-	tailor  Tailorer
-	log     *slog.Logger
-	maxTrys int
+	repo      Repository
+	tailor    Tailorer
+	proposals ProposalStore
+	log       *slog.Logger
+	maxTrys   int
 }
 
 // NewTailoringService builds the service.
-func NewTailoringService(repo Repository, tailor Tailorer, log *slog.Logger) *TailoringService {
+//
+// proposals may be nil, which leaves preview working and accept unavailable. That is a
+// supported degraded mode rather than a failure: a candidate can still see what
+// tailoring would do.
+func NewTailoringService(repo Repository, tailor Tailorer, proposals ProposalStore, log *slog.Logger) *TailoringService {
 	return &TailoringService{
-		repo:   repo,
-		tailor: tailor,
-		log:    log,
+		repo:      repo,
+		tailor:    tailor,
+		proposals: proposals,
+		log:       log,
 		// One generation plus one stricter retry. A third attempt is not worth a
 		// candidate's tokens: a model that has fabricated twice, the second time with
 		// its own violations quoted back at it, is not going to stop on the third.
@@ -145,4 +152,119 @@ func (s *TailoringService) TailorForJob(
 	)
 	outcome.Diff = TailoringDiff{Rejected: outcome.Containment.Violations}
 	return outcome, ErrTailoringUnsafe
+}
+
+// ErrAcceptUnavailable reports that previews cannot be accepted on this deployment.
+var ErrAcceptUnavailable = apperr.Unprocessable("tailoring_accept_unavailable",
+	"Tailored CVs cannot be saved on this deployment.")
+
+// Preview tailors a CV and records the proposal, returning it with its diff.
+//
+// The proposal is held server-side rather than handed to the client to post back: a
+// client could alter it between preview and save, and the containment verdict would
+// then describe something other than what was stored.
+func (s *TailoringService) Preview(
+	ctx context.Context, userID, versionID, jobPostingID uuid.UUID, jobDescription string,
+) (TailoringOutcome, uuid.UUID, error) {
+	outcome, err := s.TailorForJob(ctx, userID, versionID, jobDescription)
+	if err != nil {
+		return outcome, uuid.Nil, err
+	}
+	if s.proposals == nil {
+		// Preview still works; there is simply nothing to accept later.
+		return outcome, uuid.Nil, nil
+	}
+
+	proposal := TailoringProposal{
+		ID: uuid.New(), UserID: userID, SourceID: versionID, JobPostingID: jobPostingID,
+		Tailored: outcome.Tailored, Model: outcome.Meta.Model,
+		EngineVersion: outcome.Meta.EngineVersion, CreatedAt: time.Now().UTC(),
+	}
+	if err := s.proposals.Save(ctx, proposal); err != nil {
+		return outcome, uuid.Nil, err
+	}
+	return outcome, proposal.ID, nil
+}
+
+// Accept stores a previewed tailoring as a new CV version.
+//
+// Containment is re-checked here against the CURRENT source rather than trusted from
+// the preview. The source may have been re-parsed or corrected in between, and a
+// verdict reached against an older version of the facts is not a verdict about what is
+// being stored. It also means that even a forged or tampered proposal cannot produce a
+// fabricated CV: the gate is the check, never a flag someone set earlier.
+func (s *TailoringService) Accept(ctx context.Context, userID, proposalID uuid.UUID) (*Version, error) {
+	if s.proposals == nil {
+		return nil, ErrAcceptUnavailable
+	}
+
+	proposal, err := s.proposals.Load(ctx, userID, proposalID)
+	if err != nil {
+		return nil, err
+	}
+
+	source, err := s.repo.ParsedDataByVersion(ctx, userID, proposal.SourceID)
+	if err != nil {
+		return nil, err
+	}
+	skills, err := s.repo.SkillsByVersion(ctx, userID, proposal.SourceID)
+	if err != nil {
+		return nil, err
+	}
+
+	log := s.log.With(
+		slog.String("cv_version_id", proposal.SourceID.String()),
+		slog.String("user_id", userID.String()),
+	)
+
+	report := CheckContainment(source, skills, proposal.Tailored)
+	if !report.Passed {
+		// Either the source changed under the proposal or the proposal was tampered
+		// with. Both mean the same thing here: this must not be stored.
+		log.WarnContext(ctx, "a previewed tailoring no longer passes containment; refusing to store it",
+			slog.String("containment", report.Summary()))
+		return nil, ErrTailoringUnsafe
+	}
+
+	sourceVersion, err := s.repo.VersionByID(ctx, userID, proposal.SourceID)
+	if err != nil {
+		return nil, err
+	}
+
+	passed := true
+	version := &Version{
+		ID:         uuid.New(),
+		DocumentID: sourceVersion.DocumentID,
+		UserID:     userID,
+		// A tailored CV is generated text, not an uploaded document. It gets its own
+		// storage key so later rendering has somewhere to put the file.
+		StorageKey:              "tenants/" + userID.String() + "/tailored/" + uuid.New().String(),
+		ChecksumSHA256:          make([]byte, 32),
+		AVStatus:                AVClean,
+		ParseStatus:             ParseParsed,
+		DerivedFromVersionID:    &proposal.SourceID,
+		TailoredForJobPostingID: &proposal.JobPostingID,
+		ContainmentPassed:       &passed,
+	}
+
+	tailoredSkills := make([]Skill, 0, len(proposal.Tailored.ClaimedSkills))
+	for _, label := range proposal.Tailored.ClaimedSkills {
+		tailoredSkills = append(tailoredSkills, Skill{RawLabel: label, Source: SkillSourceAI})
+	}
+
+	if err := s.repo.StoreTailoredVersion(ctx, version, proposal.Tailored, tailoredSkills); err != nil {
+		return nil, err
+	}
+
+	// Best effort: a proposal left behind expires on its own, and failing the request
+	// after the version is safely stored would be worse than a stale key.
+	if derr := s.proposals.Delete(ctx, userID, proposalID); derr != nil {
+		log.WarnContext(ctx, "could not clear an accepted tailoring proposal", slog.Any("error", derr))
+	}
+
+	log.InfoContext(ctx, "tailored CV accepted",
+		slog.String("tailored_version_id", version.ID.String()),
+		slog.Int("version_no", version.VersionNo),
+	)
+	return version, nil
 }

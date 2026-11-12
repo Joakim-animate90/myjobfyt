@@ -35,6 +35,9 @@ func (h *TailoringHandler) RegisterRoutes(r chi.Router, requireAuth func(http.Ha
 		// described in their name, so this returns the proposal and the diff and
 		// changes nothing. Accepting it is a separate, explicit act.
 		r.Post("/cvs/versions/{versionID}/tailor", h.preview)
+		// Accepting is a separate, explicit act. The candidate approves the diff they
+		// were shown; the content itself never travels back through the client.
+		r.Post("/cvs/tailoring/{proposalID}/accept", h.accept)
 	})
 }
 
@@ -42,6 +45,9 @@ type tailorRequest struct {
 	// JobDescription is attacker-controlled text. It is never interpolated into a
 	// prompt's instructions — the AI layer offers no route for that.
 	JobDescription string `json:"job_description" validate:"required,min=50,max=20000"`
+	// JobPostingID records which posting this was tailored for. A tailored CV without
+	// it has no verifiable provenance.
+	JobPostingID uuid.UUID `json:"job_posting_id" validate:"required"`
 }
 
 func (h *TailoringHandler) preview(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +74,7 @@ func (h *TailoringHandler) preview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outcome, err := h.svc.TailorForJob(r.Context(), userID, versionID, in.JobDescription)
+	outcome, proposalID, err := h.svc.Preview(r.Context(), userID, versionID, in.JobPostingID, in.JobDescription)
 	if err != nil {
 		// A refusal is not an error the client should retry, and it carries information
 		// the candidate is entitled to: what the platform declined to claim for them.
@@ -87,13 +93,54 @@ func (h *TailoringHandler) preview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpx.JSON(w, r, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"tailored": toTailoredResponse(outcome.Tailored),
 		// The diff is the point of this endpoint. The candidate approves the change,
 		// which they cannot do without seeing what it is.
 		"diff":               toDiffResponse(outcome.Diff),
 		"containment_passed": outcome.Containment.Passed,
 		"attempts":           outcome.Attempts,
+	}
+	if proposalID != uuid.Nil {
+		body["proposal_id"] = proposalID
+	}
+	httpx.JSON(w, r, http.StatusOK, body)
+}
+
+// accept stores a previewed tailoring the candidate has approved.
+func (h *TailoringHandler) accept(w http.ResponseWriter, r *http.Request) {
+	if h.svc == nil {
+		httpx.Error(w, r, apperr.Unprocessable("tailoring_unavailable",
+			"CV tailoring is not available on this deployment."))
+		return
+	}
+
+	userID, err := principalUserID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	proposalID, err := uuid.Parse(chi.URLParam(r, "proposalID"))
+	if err != nil {
+		httpx.Error(w, r, apperr.NotFound("tailoring proposal"))
+		return
+	}
+
+	version, err := h.svc.Accept(r.Context(), userID, proposalID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+
+	httpx.JSON(w, r, http.StatusCreated, map[string]any{
+		"version": map[string]any{
+			"id":                 version.ID,
+			"version_no":         version.VersionNo,
+			"derived_from":       version.DerivedFromVersionID,
+			"tailored_for":       version.TailoredForJobPostingID,
+			"containment_passed": version.ContainmentPassed,
+			"created_at":         version.CreatedAt,
+		},
 	})
 }
 

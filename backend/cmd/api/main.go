@@ -364,6 +364,7 @@ func buildTailoringService(ctx context.Context, cfg *config.Config, db *postgres
 	return cv.NewTailoringService(
 		cv.NewPostgresRepository(db),
 		cv.NewAITailorer(client, cv.TailorerConfig{}),
+		cv.NewRedisProposalStore(redis),
 		log,
 	), nil
 }
