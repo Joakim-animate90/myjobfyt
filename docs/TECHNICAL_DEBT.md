@@ -64,21 +64,29 @@ nobody verifies is worse than none, because it is believed.
 
 ---
 
-## TD-04 — Integration tests are not yet automated
-**Kind:** shortcut · **Where:** no `//go:build integration` tests exist
+## TD-04 — Integration tests exist but depend on a hand-started stack
+**Kind:** shortcut · **Where:** `//go:build integration` tests across `internal/`
 
-Repository SQL, the database invariants and the migration round-trip were all verified by
-hand against real Postgres during this work, and the results are recorded in
-`ENGINEERING_AUDIT.md`. None of it is automated.
+There are now 760 integration cases running against real Postgres, NATS and MinIO,
+including the CV pipeline end to end, the idempotency store's claim and concurrency
+semantics, and the embedding storage round trip. They are skipped unless `POSTGRES_DSN`,
+`NATS_URL` and `STORAGE_ENDPOINT` are set, so they pass vacuously wherever the stack is
+not running — which includes CI today.
 
-**Why.** The testcontainers harness is a substantial piece of work in itself, and the
-schema was still settling.
+**Why.** The tests were worth having before the harness that runs them automatically;
+writing them first is what surfaced the lost dead letters and the flattened traces. The
+remaining work is a testcontainers harness so they bring up their own dependencies and
+cannot be skipped into silence.
 
-**Pay down immediately.** This is the highest-priority debt item. Tracked in `MJF-081`.
+**Pay down immediately.** Still the highest-priority debt item, now narrowed from "no
+integration tests" to "no automation and no guard against silent skipping". Tracked in
+`MJF-081`, which should also fail the build if the integration suite reports zero tests
+run.
 
-**Risk if ignored:** the invariants protecting candidates from unauthorised submissions
-and fabricated CVs are currently verified *once*, not continuously. A refactor could
-remove a constraint and nothing would notice.
+**Risk if ignored:** the suite looks green while testing nothing. That is worse than an
+absent suite, because an absent one does not give false assurance. The invariants
+protecting candidates from unauthorised submissions and fabricated CVs are covered by
+tests nobody is guaranteed to run.
 
 ---
 
