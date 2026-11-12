@@ -38,19 +38,32 @@ than fixtures.
 visible in the database, with the pipeline traceable end to end and its failure modes —
 scanned PDF, encrypted PDF, schema violation — each producing a clear, actionable outcome.
 
-**Status: 11 of 12 delivered.** Only `MJF-012` (CV builder and PDF renderer) remains. A
-real `.docx` goes from upload to parsed through live NATS, Postgres and MinIO; the chain
-appears as one OpenTelemetry trace; a parse failure emails the candidate an actionable
-reason; dead-letter depth is alertable; tailoring is gated by a factual-containment
-validator that a prompt injection cannot defeat; and the CV checker scores
-deterministically with or without the AI provider.
+**Status: complete, 12 of 12.** A real `.docx` goes from upload to parsed through live
+NATS, Postgres and MinIO; the chain appears as one OpenTelemetry trace; a parse failure
+emails the candidate an actionable reason; dead-letter depth is alertable; tailoring is
+gated by a factual-containment validator that a prompt injection cannot defeat; the CV
+checker scores deterministically with or without the AI provider; and the builder renders
+an ATS-parseable PDF whose text extracts back out, with preview and download
+byte-identical.
 
-Three defects were found by running the system rather than by reading it, and each had
-been invisible to the test suite: the worker could not start at all once `cv.parsed` had
-two consumers (work-queue retention forbids it); dead letters from messages carrying no
-type were published to an unroutable subject and silently discarded; and no tracer
-provider was ever installed, so every span was dropped while the code read as fully
-instrumented.
+The builder deviates from its issue's proposal: it renders in process rather than in a
+sandboxed HTML-to-PDF container. An HTML engine resolves URLs and understands `file://`,
+so the sandbox would be a configuration that has to stay correct for ever; an in-process
+renderer with no URL resolver and no file reader makes the same guarantee a property of
+the code. The cost is that templates are Go code rather than markup.
+
+Four defects were found by running the system rather than by reading it, and each had
+been invisible to a passing test suite: the worker could not start at all once
+`cv.parsed` had two consumers (work-queue retention forbids it); dead letters from
+messages carrying no type were published to an unroutable subject and silently
+discarded; no tracer provider was ever installed, so every span was dropped while the
+code read as fully instrumented; and the PDF builder wrote UTF-8 into WinAnsi-encoded
+strings, so every bullet and every accented name came out as mojibake.
+
+The common thread is worth naming: in each case a test existed and passed. The tests
+asserted that a function returned no error, that a consumer was registered, that a span
+was created — never that the resulting behaviour was correct end to end. Exercising the
+running system is what found all four.
 
 The outstanding caveat across all of M1: **no live Claude API call has been made**, as
 there are no credentials on the development machine. Extraction, tailoring and the
