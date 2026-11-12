@@ -38,6 +38,25 @@ than fixtures.
 visible in the database, with the pipeline traceable end to end and its failure modes —
 scanned PDF, encrypted PDF, schema violation — each producing a clear, actionable outcome.
 
+**Status: 11 of 12 delivered.** Only `MJF-012` (CV builder and PDF renderer) remains. A
+real `.docx` goes from upload to parsed through live NATS, Postgres and MinIO; the chain
+appears as one OpenTelemetry trace; a parse failure emails the candidate an actionable
+reason; dead-letter depth is alertable; tailoring is gated by a factual-containment
+validator that a prompt injection cannot defeat; and the CV checker scores
+deterministically with or without the AI provider.
+
+Three defects were found by running the system rather than by reading it, and each had
+been invisible to the test suite: the worker could not start at all once `cv.parsed` had
+two consumers (work-queue retention forbids it); dead letters from messages carrying no
+type were published to an unroutable subject and silently discarded; and no tracer
+provider was ever installed, so every span was dropped while the code read as fully
+instrumented.
+
+The outstanding caveat across all of M1: **no live Claude API call has been made**, as
+there are no credentials on the development machine. Extraction, tailoring and the
+checker's model pass are covered against local stubs, so their safety properties are
+tested but their output quality is unmeasured.
+
 ### M2 — Job Acquisition (9 issues, 6 critical)
 
 Real postings from lawful sources, normalised and deduplicated.
