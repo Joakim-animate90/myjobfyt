@@ -28,13 +28,30 @@ its own — without it, the admin's end-to-end trace (I2) silently breaks at eve
 | Stream | Subjects | Retention | Max age | Replicas | Dead letter |
 |---|---|---|---|---|---|
 | `IDENTITY` | `myjobfyt.identity.>` | interest | 7d | 1 (3 in prod) | `myjobfyt.dlq.identity` |
-| `CV` | `myjobfyt.cv.>` | workqueue | 7d | 1 (3) | `myjobfyt.dlq.cv` |
-| `JOBS` | `myjobfyt.jobs.>` | workqueue | 3d | 1 (3) | `myjobfyt.dlq.jobs` |
-| `MATCHING` | `myjobfyt.matching.>` | workqueue | 3d | 1 (3) | `myjobfyt.dlq.matching` |
-| `APPLICATIONS` | `myjobfyt.applications.>` | workqueue | 30d | 1 (3) | `myjobfyt.dlq.applications` |
-| `OUTREACH` | `myjobfyt.outreach.>` | workqueue | 30d | 1 (3) | `myjobfyt.dlq.outreach` |
+| `CV` | `myjobfyt.cv.>` | interest | 7d | 1 (3) | `myjobfyt.dlq.cv` |
+| `JOBS` | `myjobfyt.jobs.>` | interest | 3d | 1 (3) | `myjobfyt.dlq.jobs` |
+| `MATCHING` | `myjobfyt.matching.>` | interest | 3d | 1 (3) | `myjobfyt.dlq.matching` |
+| `APPLICATIONS` | `myjobfyt.applications.>` | interest | 30d | 1 (3) | `myjobfyt.dlq.applications` |
+| `OUTREACH` | `myjobfyt.outreach.>` | interest | 30d | 1 (3) | `myjobfyt.dlq.outreach` |
 | `BILLING` | `myjobfyt.billing.>` | interest | 90d | 1 (3) | `myjobfyt.dlq.billing` |
 | `DLQ` | `myjobfyt.dlq.>` | limits | 90d | 1 (3) | — |
+
+Every domain stream uses **interest** retention, because these are fan-out event streams
+rather than work queues. A work-queue stream delivers each message to exactly one consumer
+and therefore rejects a second consumer filtering the same subject — and `cv.parsed` alone
+is consumed independently by skill normalisation, by embedding and (later) by matching.
+Declaring these as work queues made the worker fail to start with `filtered consumer not
+unique on workqueue stream` as soon as the second `cv.parsed` consumer was added. Interest
+retention gives each consumer its own copy while still reclaiming storage once every
+registered consumer has acked.
+
+Several worker replicas competing for the same message is a *consumer*-level property, not
+a stream-level one: a durable consumer shared between replicas already distributes work
+among them, with no need for work-queue retention.
+
+JetStream cannot change retention in place. `EnsureStreams` therefore reports a mismatch
+and refuses to start rather than deleting a stream that may hold a candidate's CV
+mid-pipeline — see TD-13.
 
 `JOBS` and `MATCHING` have short retention because they are high-volume and fully
 reconstructible from `raw_job_payloads` — replaying discovery is cheap. `APPLICATIONS` and
@@ -65,6 +82,7 @@ Legend: **Idem** = idempotency key · **MD** = `MaxDeliver` · **AW** = `AckWait
 | `cv.scanned` | `cv_version_id, av_status` | `text-extract` | `cv_version_id` | 3 / 1m |
 | `cv.text_extracted` | `cv_version_id, char_count, page_count` | `structure-extract` | `cv_version_id` | 3 / 3m |
 | `cv.parsed` | `cv_id, version_id, user_id, skill_count, confidence_avg` | `embed`, `rescore-matches`, `notify`, `analytics` | `cv_version_id` | 5 / 2m |
+| `cv.embedded` | `cv_id, version_id, user_id, model, kinds, dims, backfilled` | *(none yet — see TD-12)* | `cv_version_id` | 4 / 2m |
 | `cv.parse_failed` | `cv_version_id, reason, stage` | `notify`, `admin-alert` | `cv_version_id:stage` | 3 / 1m |
 | `cv.analysis_requested` | `cv_version_id, target_role` | `cv-checker` | `cv_version_id:target_role` | 3 / 3m |
 | `cv.analysis_completed` | `cv_version_id, analysis_id, overall_score` | `notify` | `analysis_id` | 3 / 1m |

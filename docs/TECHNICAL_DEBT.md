@@ -202,6 +202,49 @@ preserving immutability.
 
 ---
 
+## TD-12 — `cv.embedded` has no consumer, so degraded match scores are never upgraded
+**Kind:** deliberate · **Where:** `internal/domain/cv/worker.go`
+
+When the embedding provider is unavailable, matching falls back to the lexical path and
+marks the score degraded. The CV is re-embedded later by the backfill sweep, which
+publishes `cv.embedded` so that those scores can be recomputed. Nothing subscribes to
+that event today.
+
+**Why.** Rescoring is matching's job and matching does not exist yet (`MJF-031`).
+Everything rescoring needs is in place — the vectors, the recorded method, the recovery
+sweep and the event — but wiring a consumer before there is anything to rescore would
+mean inventing the scoring model here, in the wrong domain.
+
+**Pay down when:** `MJF-031` lands. It must subscribe to `cv.embedded` and recompute any
+match whose score was recorded as degraded, rather than only scoring new matches.
+
+**Risk if ignored:** a candidate whose CV happened to be processed during an embedding
+outage keeps weaker match scores permanently, with nothing in the product indicating it.
+This is invisible to the candidate and to operators, which is what makes it worth
+recording rather than remembering.
+
+---
+
+## TD-13 — Stream retention changes require manual intervention
+**Kind:** deliberate · **Where:** `internal/platform/events/streams.go`
+
+JetStream cannot change a stream's retention policy in place. `EnsureStreams` detects a
+mismatch and fails with the stream name and the command to run, rather than applying it.
+
+**Why.** Applying it means deleting the stream, which discards every message not yet
+acked by all of its consumers — for the CV stream, a candidate's upload mid-pipeline.
+That is an operator's decision, made after draining the workers, not something a process
+should do to itself on startup.
+
+**Pay down when:** a retention change is needed in an environment where the manual step
+is unacceptable. The fix is a documented drain-and-recreate runbook step, not automation
+in `EnsureStreams`.
+
+**Risk if ignored:** a deployment whose topology changed retention fails to start, with
+an error that says exactly what to do. Loud and safe, which is the intent.
+
+---
+
 ## Summary
 
 | ID | Kind | Priority | Tracked by |
@@ -212,5 +255,6 @@ preserving immutability.
 | TD-01 | shortcut | before launch | `MJF-087` |
 | TD-06 | shortcut | low | `MJF-070` |
 | TD-07 | deliberate | resolves naturally | `MJF-050` |
-| TD-02, TD-08, TD-09, TD-11 | deliberate | threshold-triggered | — |
+| TD-12 | deliberate | with `MJF-031` | `MJF-031` |
+| TD-02, TD-08, TD-09, TD-11, TD-13 | deliberate | threshold-triggered | — |
 | TD-05 | deliberate | never | — |

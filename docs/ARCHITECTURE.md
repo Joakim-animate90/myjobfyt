@@ -150,7 +150,9 @@ is also the key into logs and traces — so a user-reported error is one query a
 Streams, subjects, and consumer configuration live in `EVENT_CATALOG.md`. The invariants:
 
 - **Subjects:** `myjobfyt.<domain>.<event>` — e.g. `myjobfyt.cv.uploaded`.
-- **Streams:** one per domain, file-backed, work-queue or interest retention, explicit max age.
+- **Streams:** one per domain, file-backed, interest retention for the domain streams and
+  limits retention for the DLQ, with an explicit max age. Domain streams are fan-out: more
+  than one consumer subscribes to the same subject, which work-queue retention forbids.
 - **Consumers:** durable, explicit ack, `AckWait` sized above the handler timeout,
   `MaxDeliver` set, overflow to a per-stream dead-letter subject.
 - **Envelope:** `event_id`, `type`, `version`, `occurred_at`, `correlation_id`,
