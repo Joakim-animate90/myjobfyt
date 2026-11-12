@@ -23,12 +23,13 @@ product is weak.
 | CV upload, library, antivirus, text extraction | complete, pipeline verified end to end |
 | AI layer — provider abstraction, structured output, injection boundary | complete |
 | CV structured extraction — schema, evidence verification, persistence | complete (never yet run against the real provider) |
-| CV skill normalisation, embeddings, tailoring, checker | not started |
+| CV skill normalisation — curated taxonomy, exact matching | complete |
+| CV embeddings, tailoring, checker | not started |
 | Job acquisition, matching, applications, outreach, analytics, admin | not started |
 | Frontend | not started |
 | Kubernetes, Helm, FluxCD, CI/CD | not started |
 
-518 tests passing, plus integration tests against live Postgres and MinIO.
+537 tests passing, plus integration tests against live Postgres and MinIO.
 
 ## What makes this different
 
@@ -48,6 +49,10 @@ in `docs/PRODUCT_ANALYSIS.md` §6:
 - **CV tailoring never invents anything.** A containment validator rejects any output that
   introduces an employer, title, date, certification or skill absent from the source CV.
 - **Sensitive screening questions are never auto-answered** on any tier.
+- **Skill matching is exact, not fuzzy.** Measured: pg_trgm scores `scala`/`scale`
+  (wrong) above `kotlin`/`koltin` (right), so no threshold is safe. A curated alias list
+  plus a triage queue of unmatched labels does the job without ever conflating Java
+  with JavaScript.
 - **Authenticated job boards are reached only through the candidate's own browser session.**
   No CAPTCHA solving, no anti-bot circumvention, no credential relay.
 
