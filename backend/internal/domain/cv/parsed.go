@@ -35,6 +35,11 @@ type ParsedData struct {
 	// expensive problem than a stale field.
 	CorrectedFields []string
 
+	// ClaimedSkills are the skills this CV states. Populated for a tailored CV, whose
+	// skill list is part of the generated output and must be validated against the
+	// source before it is stored; a parsed CV's skills live in cv_skills instead.
+	ClaimedSkills []string
+
 	TotalExperienceMonths *int
 	DetectedSeniority     string
 	EngineVersion         string
