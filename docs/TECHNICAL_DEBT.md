@@ -253,6 +253,32 @@ an error that says exactly what to do. Loud and safe, which is the intent.
 
 ---
 
+## TD-14 — The CV builder cannot set non-Latin names
+**Kind:** shortcut · **Where:** `internal/platform/pdfgen`
+
+The renderer uses the PDF base-14 fonts, which cover WinAnsiEncoding. A CV containing
+Japanese, Chinese, Arabic, Cyrillic, Greek, Hebrew, Devanagari or even Polish is refused
+with an error naming the character and suggesting the candidate upload a file instead.
+
+**Why.** Embedding a Unicode TrueType font means CID font objects, a ToUnicode CMap and
+subsetting to keep the file small — a substantial piece of work, and one that has to be
+right or the output stops extracting as text, which is the builder's whole purpose. The
+base fonts need nothing bundled and extract perfectly.
+
+Refusing is the right behaviour given the limitation. Substituting characters would put a
+CV in front of an employer with the candidate's own name mangled, which is worse than
+telling them the builder cannot set it.
+
+**Pay down when:** before any launch outside Latin-script markets, and sooner if
+candidates hit it. This is a hard block for those users, not a degradation: they cannot
+use the builder at all. It is also the kind of limitation that looks like indifference
+rather than a sequencing decision, which is its own cost.
+
+**Risk if ignored:** the product is unusable for a large share of the world's
+candidates, and says so only at the point they try to build a CV.
+
+---
+
 ## Summary
 
 | ID | Kind | Priority | Tracked by |
@@ -264,5 +290,6 @@ an error that says exactly what to do. Loud and safe, which is the intent.
 | TD-06 | shortcut | low | `MJF-070` |
 | TD-07 | deliberate | resolves naturally | `MJF-050` |
 | TD-12 | deliberate | with `MJF-031` | `MJF-031` |
+| TD-14 | shortcut | before non-Latin launch | — |
 | TD-02, TD-08, TD-09, TD-11, TD-13 | deliberate | threshold-triggered | — |
 | TD-05 | deliberate | never | — |
