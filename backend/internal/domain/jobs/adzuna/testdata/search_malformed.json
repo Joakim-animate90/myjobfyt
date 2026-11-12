@@ -1,0 +1,38 @@
+{
+  "__CLASS__": "Adzuna::API::Response::JobSearchResults",
+  "count": 4,
+  "results": [
+    {
+      "id": "5000000001",
+      "title": "Usable Posting",
+      "description": "This one is fine despite its neighbours.",
+      "company": { "display_name": "Delta Ltd" },
+      "location": { "display_name": "Leeds", "area": ["UK", "Yorkshire", "Leeds"] },
+      "salary_is_predicted": "yes",
+      "created": "not-a-date",
+      "redirect_url": "https://www.adzuna.co.uk/jobs/land/ad/5000000001"
+    },
+    {
+      "title": "Posting With No Id",
+      "description": "Cannot be deduplicated or re-recognised, so must be dropped.",
+      "company": { "display_name": "Epsilon Ltd" }
+    },
+    {
+      "id": "5000000003",
+      "title": "",
+      "description": "An empty title cannot be matched, shown or applied to.",
+      "company": { "display_name": "Zeta Ltd" }
+    },
+    {
+      "id": "5000000004",
+      "title": "Posting With Nothing Else",
+      "company": null,
+      "location": null,
+      "category": null,
+      "salary_min": null,
+      "contract_type": "",
+      "contract_time": "",
+      "created": ""
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "__CLASS__": "Adzuna::API::Response::JobSearchResults",
+  "count": 1243,
+  "mean": 62500,
+  "results": [
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "id": "4812001234",
+      "title": "Senior Backend Engineer (Go)",
+      "description": "We are looking for a backend engineer with strong Go and PostgreSQL experience to work on our payments platform…",
+      "company": { "__CLASS__": "Adzuna::API::Response::Company", "display_name": "Acme Payments Ltd" },
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Shoreditch, East London",
+        "area": ["UK", "London", "East London", "Shoreditch"]
+      },
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "IT Jobs",
+        "tag": "it-jobs"
+      },
+      "salary_min": 70000,
+      "salary_max": 85000,
+      "salary_is_predicted": "0",
+      "contract_type": "permanent",
+      "contract_time": "full_time",
+      "created": "2026-03-01T09:14:22Z",
+      "redirect_url": "https://www.adzuna.co.uk/jobs/land/ad/4812001234",
+      "latitude": 51.5266,
+      "longitude": -0.0799
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "id": 4812009999,
+      "title": "Part-time Data Analyst",
+      "description": "Three days a week supporting the finance team.",
+      "company": { "display_name": "Beta Analytics" },
+      "location": { "display_name": "Manchester", "area": ["UK", "North West", "Manchester"] },
+      "salary_min": 32000,
+      "salary_max": 32000,
+      "salary_is_predicted": "1",
+      "contract_time": "part_time",
+      "created": "2026-02-27T16:02:00Z",
+      "redirect_url": "https://www.adzuna.co.uk/jobs/land/ad/4812009999"
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "id": "4812007777",
+      "title": "Contract Platform Engineer",
+      "description": "Six-month engagement, outside IR35.",
+      "company": { "display_name": "Gamma Consulting" },
+      "location": { "display_name": "Remote", "area": ["UK"] },
+      "contract_type": "contract",
+      "contract_time": "full_time",
+      "created": "2026-02-28T11:00:00Z",
+      "redirect_url": "https://www.adzuna.co.uk/jobs/land/ad/4812007777"
+    }
+  ]
+}

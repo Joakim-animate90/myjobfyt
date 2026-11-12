@@ -1,0 +1,5 @@
+{
+  "__CLASS__": "Adzuna::API::Response::Error",
+  "display": "Too Many Requests",
+  "exception": "RATE_LIMIT_EXCEEDED"
+}

@@ -20,6 +20,8 @@ import (
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/config"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/cv"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/entitlements"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/jobs"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/domain/jobs/sources"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/ai"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/antivirus"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/docextract"
@@ -165,6 +167,24 @@ func run() error {
 			MaxChars: cfg.Extract.MaxChars,
 		},
 	})
+
+	// Job sources are assembled here so the startup log names which adapters this
+	// deployment can actually use, and which are enabled in the database with nothing
+	// to talk to them.
+	sourceRegistry, err := sources.BuildRegistry(cfg, log)
+	if err != nil {
+		return fmt.Errorf("build job source registry: %w", err)
+	}
+	sourceRecords, err := jobs.NewPostgresSourceRepository(db).EnabledSources(ctx)
+	if err != nil {
+		return fmt.Errorf("load job sources: %w", err)
+	}
+	boundSources, unboundSources := sourceRegistry.Bind(sourceRecords)
+	sources.ReportUnboundSources(unboundSources, log)
+	log.Info("job sources ready",
+		slog.Int("usable", len(boundSources)),
+		slog.Int("enabled_without_adapter", len(unboundSources)),
+	)
 
 	if !cvWorker.CandidateNotificationsEnabled() {
 		log.Warn("candidate notifications are DISABLED; a CV that fails to parse will be " +

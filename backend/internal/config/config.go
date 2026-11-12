@@ -51,6 +51,7 @@ type Config struct {
 	Antivirus AntivirusConfig
 	Extract   ExtractConfig
 	AI        AIConfig
+	JobSource JobSourcesConfig
 	Embed     EmbedConfig
 	Telemetry TelemetryConfig
 	Worker    WorkerConfig
@@ -163,6 +164,37 @@ type SMTPConfig struct {
 	// AppBaseURL is the origin used to build links in emails.
 	AppBaseURL string        `env:"APP_BASE_URL" envDefault:"http://localhost:13000"`
 	Timeout    time.Duration `env:"SMTP_TIMEOUT" envDefault:"15s"`
+}
+
+// JobSourcesConfig holds per-source credentials.
+//
+// Credentials come from the environment and are never committed. Each source is
+// independently optional: an unconfigured source is reported at startup and skipped,
+// rather than failing the process, so a deployment can run with whichever sources it
+// has keys for.
+type JobSourcesConfig struct {
+	Adzuna AdzunaConfig
+}
+
+// AdzunaConfig configures the Adzuna adapter.
+type AdzunaConfig struct {
+	// AppID and AppKey are the self-service credentials from developer.adzuna.com.
+	// Both empty means the adapter is not registered.
+	AppID  string `env:"ADZUNA_APP_ID"`
+	AppKey string `env:"ADZUNA_APP_KEY"`
+	// BaseURL points at a test double. Empty uses the real API.
+	BaseURL string `env:"ADZUNA_BASE_URL"`
+	// Timeout bounds one request.
+	Timeout time.Duration `env:"ADZUNA_TIMEOUT" envDefault:"20s"`
+	// RequestsPerMinute paces requests. Adzuna publishes no hard figure, so this is
+	// deliberately conservative: being throttled costs a whole discovery run, while
+	// being slower costs minutes on a schedule that runs hourly.
+	RequestsPerMinute int `env:"ADZUNA_RATE_PER_MIN" envDefault:"20"`
+}
+
+// Configured reports whether both credentials are present.
+func (c AdzunaConfig) Configured() bool {
+	return strings.TrimSpace(c.AppID) != "" && strings.TrimSpace(c.AppKey) != ""
 }
 
 type AIConfig struct {

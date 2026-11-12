@@ -1,0 +1,6 @@
+{
+  "__CLASS__": "Adzuna::API::Response::Error",
+  "display": "Internal Server Error",
+  "doc": "https://developer.adzuna.com/docs",
+  "exception": "INTERNAL_SERVER_ERROR"
+}
