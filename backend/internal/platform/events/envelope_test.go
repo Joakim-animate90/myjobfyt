@@ -2,6 +2,8 @@ package events_test
 
 import (
 	"encoding/json"
+	"github.com/nats-io/nats.go/jetstream"
+	"strings"
 	"testing"
 	"time"
 
@@ -279,5 +281,47 @@ func TestStreamsHaveNonZeroRetention(t *testing.T) {
 		if len(s.Subjects) == 0 {
 			t.Errorf("stream %s has no subjects", s.Name)
 		}
+	}
+}
+
+func TestNoDomainStreamUsesWorkQueueRetention(t *testing.T) {
+	// A work-queue stream delivers each message to exactly one consumer and so rejects
+	// a second consumer filtering the same subject:
+	//
+	//	nats: API error: code=400 err_code=10100
+	//	description=filtered consumer not unique on workqueue stream
+	//
+	// Every domain stream here is a fan-out event stream. cv.parsed alone is consumed
+	// independently by skill normalisation, by embedding and later by matching. The
+	// failure does not appear until the second consumer on a subject is registered, so
+	// it would otherwise lie dormant in the topology until some unrelated feature added
+	// one and the whole worker refused to start.
+	for _, s := range events.Streams() {
+		if s.Retention == jetstream.WorkQueuePolicy {
+			t.Errorf("stream %s uses work-queue retention; a second consumer on any of "+
+				"its subjects %v will fail to register", s.Name, s.Subjects)
+		}
+	}
+}
+
+func TestRetentionMismatchErrorTellsAnOperatorWhatToDo(t *testing.T) {
+	// This error is read exactly once, by whoever is staring at a worker that will not
+	// start. It has to name the stream and say what to run.
+	err := &events.ErrRetentionMismatch{
+		Stream: "CV",
+		Have:   jetstream.WorkQueuePolicy,
+		Want:   jetstream.InterestPolicy,
+	}
+
+	msg := err.Error()
+	for _, want := range []string{"CV", "workqueue", "interest", "nats stream rm CV", "drain"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the error does not mention %q: %s", want, msg)
+		}
+	}
+
+	// It must not stringify the policies as the integers the jetstream constants are.
+	if strings.Contains(msg, "has 2 retention") || strings.Contains(msg, "expects 1") {
+		t.Errorf("retention policies rendered as integers: %s", msg)
 	}
 }
