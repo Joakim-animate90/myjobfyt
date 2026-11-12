@@ -50,6 +50,7 @@ type Repository interface {
 	VersionsNeedingEmbedding(ctx context.Context, model string, limit int) ([]uuid.UUID, error)
 	VersionsWithoutAnyEmbedding(ctx context.Context, limit int) ([]uuid.UUID, error)
 	CandidateEmail(ctx context.Context, userID uuid.UUID) (string, error)
+	StoreTailoredVersion(ctx context.Context, v *Version, parsed *ParsedData, skills []Skill) error
 	EmbeddingInputs(ctx context.Context, versionID uuid.UUID) (EmbeddingInput, error)
 
 	SetLabel(ctx context.Context, userID, documentID uuid.UUID, label string) error
@@ -176,6 +177,46 @@ func (r *PostgresRepository) insertVersion(ctx context.Context, v *Version) erro
 		return apperr.Internalf(err, "insert cv version")
 	}
 	return nil
+}
+
+// StoreTailoredVersion persists a tailored CV and its content in one transaction.
+//
+// Atomic because a tailored version row without its parsed content is a CV the
+// candidate can attach to an application and that nothing can validate afterwards. The
+// containment verdict is required by the caller rather than defaulted: the schema's
+// cv_versions_tailored_requires_containment refuses a tailored version without one, and
+// a default here would be a way to satisfy that constraint without having run the check.
+func (r *PostgresRepository) StoreTailoredVersion(ctx context.Context, v *Version, parsed *ParsedData, skills []Skill) error {
+	if v == nil || parsed == nil {
+		return apperr.Internalf(nil, "a tailored version needs both a version row and its content")
+	}
+	if v.ContainmentPassed == nil || !*v.ContainmentPassed {
+		// Belt and braces with the database constraint. Reaching here with an unset or
+		// false verdict means a caller bypassed the gate, which is worth failing loudly
+		// rather than letting the constraint produce a less specific error.
+		return apperr.Internalf(nil,
+			"refusing to store a tailored version whose factual containment did not pass")
+	}
+	if v.DerivedFromVersionID == nil {
+		return apperr.Internalf(nil, "a tailored version must record the version it came from")
+	}
+
+	return r.db.InTx(ctx, func(ctx context.Context) error {
+		next, err := r.nextVersionNo(ctx, v.DocumentID)
+		if err != nil {
+			return err
+		}
+		v.VersionNo = next
+		if err := r.insertVersion(ctx, v); err != nil {
+			return err
+		}
+
+		parsed.CVVersionID = v.ID
+		parsed.UserID = v.UserID
+		// InTx joins the transaction already in this context rather than opening a
+		// second one, so the version and its content commit or roll back together.
+		return r.StoreParsedData(ctx, parsed, skills)
+	})
 }
 
 // NextVersionNo returns the next version number for a document the user owns.
