@@ -7,12 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/apperr"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/ai"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/antivirus"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/docextract"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/embed"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/events"
 	"github.com/google/uuid"
 )
@@ -32,6 +34,16 @@ type Extractor interface {
 	ExtractCV(ctx context.Context, rawText string) (ExtractedCV, ExtractionMeta, error)
 }
 
+// Embedder is the vector surface this domain needs.
+//
+// Optional: when absent, matching falls back to lexical similarity and marks affected
+// matches degraded. A matching engine that stops working without embeddings is a
+// matching engine that stops working.
+type Embedder interface {
+	Embed(ctx context.Context, texts []string) ([]embed.Vector, string, error)
+	Name() string
+}
+
 // ExtractionMeta is what the extractor reports about the call itself, for logging and
 // cost attribution.
 type ExtractionMeta struct {
@@ -47,10 +59,16 @@ type Worker struct {
 	store     ObjectStore
 	scanner   Scanner
 	extractor Extractor
+	embedder  Embedder
 	bus       events.Publisher
 	log       *slog.Logger
 	now       func() time.Time
 	limits    docextract.Limits
+
+	// lastModel is the embedding model the provider last reported. Guarded because the
+	// backfill goroutine reads it while consumer goroutines write it.
+	modelMu   sync.RWMutex
+	lastModel string
 }
 
 // WorkerDeps are the worker's collaborators.
@@ -63,10 +81,12 @@ type WorkerDeps struct {
 	// pipeline runs end to end without an API key configured; the worker logs that the
 	// stage is disabled on startup rather than leaving it to be discovered.
 	Extractor Extractor
-	Bus       events.Publisher
-	Logger    *slog.Logger
-	Now       func() time.Time
-	Limits    docextract.Limits
+	// Embedder may be nil, which leaves matching on the lexical path.
+	Embedder Embedder
+	Bus      events.Publisher
+	Logger   *slog.Logger
+	Now      func() time.Time
+	Limits   docextract.Limits
 }
 
 // NewWorker builds the CV worker.
@@ -84,6 +104,7 @@ func NewWorker(d WorkerDeps) *Worker {
 		store:     d.Store,
 		scanner:   d.Scanner,
 		extractor: d.Extractor,
+		embedder:  d.Embedder,
 		bus:       d.Bus,
 		log:       d.Logger,
 		now:       now,
@@ -94,6 +115,9 @@ func NewWorker(d WorkerDeps) *Worker {
 // StructuredExtractionEnabled reports whether the structure stage will run, so the
 // worker can say so at startup instead of letting it be discovered from missing data.
 func (w *Worker) StructuredExtractionEnabled() bool { return w.extractor != nil }
+
+// SemanticMatchingEnabled reports whether embeddings will be generated.
+func (w *Worker) SemanticMatchingEnabled() bool { return w.embedder != nil }
 
 // uploadedPayload is the cv.uploaded event body.
 type uploadedPayload struct {
@@ -136,6 +160,25 @@ func (w *Worker) Registrations() []events.Registration {
 				}
 				return "cv.scan:" + p.VersionID
 			},
+			InFlight:   events.InFlightRetry,
+			AckWait:    2 * time.Minute,
+			MaxDeliver: 4,
+		},
+		{
+			Name:     "cv-embed",
+			Group:    "cv",
+			Stream:   "CV",
+			Subjects: []string{events.SubjectFor(events.TypeCVParsed)},
+			Handler:  w.handleParsedForEmbedding,
+			IdempotencyKey: func(env *events.Envelope) string {
+				var p parsedPayload
+				if err := env.Decode(&p); err != nil {
+					return ""
+				}
+				return "cv.embed:" + p.VersionID
+			},
+			// Re-embedding is idempotent: the same text under the same model overwrites
+			// the same row. Safe to redo after a crash.
 			InFlight:   events.InFlightRetry,
 			AckWait:    2 * time.Minute,
 			MaxDeliver: 4,
@@ -625,6 +668,162 @@ func (w *Worker) handleParsed(ctx context.Context, env *events.Envelope) error {
 	return nil
 }
 
+// handleParsedForEmbedding generates and stores a version's vectors.
+//
+// A separate consumer from skill normalisation, both fed by cv.parsed, because they
+// fail independently: an embedding outage must not stop skills being linked, and a
+// taxonomy problem must not stop vectors being stored.
+func (w *Worker) handleParsedForEmbedding(ctx context.Context, env *events.Envelope) error {
+	if w.embedder == nil {
+		// The consumer should not be registered without an embedder, but acknowledging
+		// beats dead-lettering a message nothing can process.
+		return nil
+	}
+
+	var p parsedPayload
+	if err := env.Decode(&p); err != nil {
+		return apperr.Unprocessable("undecodable_payload", "cv.parsed payload could not be decoded").
+			WithInternal(err)
+	}
+	if !p.Structured {
+		// Nothing to embed: a version parsed on text alone has no structured fields.
+		return nil
+	}
+
+	versionID, err := uuid.Parse(p.VersionID)
+	if err != nil {
+		return apperr.Unprocessable("invalid_version_id", "cv.parsed carried an invalid version id").
+			WithInternal(err)
+	}
+
+	log := w.log.With(slog.String("cv_version_id", p.VersionID))
+
+	result, err := w.embedVersion(ctx, versionID, log)
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		// Nothing embeddable, or the version went away. Already logged.
+		return nil
+	}
+
+	// Published so matching can rescore anything it had to score lexically.
+	w.publish(ctx, env, events.TypeCVEmbedded, map[string]any{
+		"cv_id":      p.CVID,
+		"version_id": p.VersionID,
+		"user_id":    p.UserID,
+		"model":      result.Model,
+		"kinds":      result.Kinds,
+		"dims":       result.Dims,
+	})
+	return nil
+}
+
+// embedResult describes a stored embedding set.
+type embedResult struct {
+	Model string
+	Kinds []string
+	Dims  int
+}
+
+// embedVersion generates and stores one version's vectors.
+//
+// Shared by the live consumer and the backfill so an outage recovery goes through
+// exactly the same validation, model handling and storage as a first-time embedding. A
+// nil result with a nil error means there was nothing to embed, which is not a failure.
+func (w *Worker) embedVersion(ctx context.Context, versionID uuid.UUID, log *slog.Logger) (*embedResult, error) {
+	input, err := w.repo.EmbeddingInputs(ctx, versionID)
+	if err != nil {
+		if apperr.KindOf(err) == apperr.KindNotFound {
+			log.InfoContext(ctx, "parsed data is gone; dropping the embedding")
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !input.HasAnything() {
+		log.InfoContext(ctx, "nothing to embed for this version")
+		return nil, nil
+	}
+
+	kinds, texts := input.Texts()
+
+	vectors, model, err := w.embedder.Embed(ctx, texts)
+	if err != nil {
+		if embed.Unavailable(err) {
+			// Retryable. Matching continues lexically in the meantime, marked degraded,
+			// and the backfill re-embeds this version once the service returns. Nothing
+			// is lost, it is only temporarily less precise.
+			log.WarnContext(ctx, "embedding service unavailable; matching will use the lexical fallback",
+				slog.Any("error", err))
+			return nil, apperr.Dependency("embedding_service", err)
+		}
+		// A non-availability failure is our bug — an empty input, a bad batch. Terminal,
+		// because retrying produces the same result.
+		log.ErrorContext(ctx, "embedding failed terminally", slog.Any("error", err))
+		return nil, apperr.Unprocessable("embedding_failed", "embeddings could not be generated").
+			WithInternal(err)
+	}
+
+	if len(vectors) != len(kinds) {
+		return nil, apperr.Internalf(
+			fmt.Errorf("embedder returned %d vectors for %d kinds", len(vectors), len(kinds)),
+			"embedding count mismatch")
+	}
+
+	stored := make([]StoredEmbedding, 0, len(vectors))
+	for i, vector := range vectors {
+		stored = append(stored, StoredEmbedding{
+			CVVersionID: versionID,
+			Kind:        kinds[i],
+			Model:       model,
+			Vector:      vector,
+		})
+	}
+
+	if err := w.repo.StoreEmbeddings(ctx, stored); err != nil {
+		if apperr.KindOf(err) == apperr.KindNotFound {
+			log.InfoContext(ctx, "cv version was deleted during embedding; dropping the result")
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	kindNames := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		kindNames = append(kindNames, string(kind))
+	}
+
+	w.rememberModel(model)
+
+	log.InfoContext(ctx, "cv embedded",
+		slog.String("model", model),
+		slog.Any("kinds", kindNames),
+		slog.Int("dims", vectors[0].Dims()),
+	)
+
+	return &embedResult{Model: model, Kinds: kindNames, Dims: vectors[0].Dims()}, nil
+}
+
+// rememberModel records the model the provider last reported.
+//
+// The model is discovered from a response rather than configured, so the worker does
+// not know it until an embedding succeeds. The backfill needs it to ask which versions
+// are missing vectors for the current model.
+func (w *Worker) rememberModel(model string) {
+	if model == "" {
+		return
+	}
+	w.modelMu.Lock()
+	w.lastModel = model
+	w.modelMu.Unlock()
+}
+
+func (w *Worker) currentModel() string {
+	w.modelMu.RLock()
+	defer w.modelMu.RUnlock()
+	return w.lastModel
+}
+
 // handleExtractionError decides whether an AI failure is worth retrying.
 func (w *Worker) handleExtractionError(ctx context.Context, env *events.Envelope, p textExtractedPayload, versionID uuid.UUID, err error, log *slog.Logger) error {
 	if ai.Retryable(err) {
@@ -695,4 +894,157 @@ func (w *Worker) publish(ctx context.Context, parent *events.Envelope, eventType
 		w.log.ErrorContext(ctx, "event publish failed",
 			slog.String("event_type", eventType), slog.Any("error", err))
 	}
+}
+
+// publishNew emits an event that is not a reaction to another event.
+//
+// The backfill has no parent envelope: it is a recovery sweep driven by a timer rather
+// than by a candidate's upload, so there is no correlation chain to carry forward and
+// inventing one would make the trace claim a causal link that does not exist. A fresh
+// correlation id keeps the sweep's own events queryable together.
+func (w *Worker) publishNew(ctx context.Context, eventType string, payload any) {
+	if w.bus == nil {
+		return
+	}
+	if err := w.bus.Publish(ctx, eventType, 1, payload); err != nil {
+		w.log.ErrorContext(ctx, "event publish failed",
+			slog.String("event_type", eventType), slog.Any("error", err))
+	}
+}
+
+// EmbeddingBackfillConfig bounds the backfill.
+type EmbeddingBackfillConfig struct {
+	// Interval between sweeps. A sweep is two cheap indexed queries when there is
+	// nothing to do, so this can be short without being expensive.
+	Interval time.Duration
+	// BatchSize bounds one sweep, so a large backlog drains over several sweeps rather
+	// than monopolising the worker and starving live uploads.
+	BatchSize int
+}
+
+func (c EmbeddingBackfillConfig) withDefaults() EmbeddingBackfillConfig {
+	if c.Interval <= 0 {
+		c.Interval = 5 * time.Minute
+	}
+	if c.BatchSize <= 0 {
+		c.BatchSize = 50
+	}
+	return c
+}
+
+// RunEmbeddingBackfill re-embeds versions that have no vectors, until ctx is cancelled.
+//
+// This is what makes an embedding outage temporary rather than permanent. While the
+// provider is down the consumer retries, exhausts its deliveries and dead-letters; the
+// CV is still parsed, still has its skills linked and still matches lexically, marked
+// degraded. Without this sweep that version would stay unembedded forever and the
+// candidate would be permanently matched on the weaker signal through no fault of
+// their own — the recovery query would exist and nothing would ever call it.
+//
+// Blocks, so callers run it in a goroutine. Returns nil on cancellation.
+func (w *Worker) RunEmbeddingBackfill(ctx context.Context, cfg EmbeddingBackfillConfig) error {
+	if w.embedder == nil {
+		return nil
+	}
+	cfg = cfg.withDefaults()
+
+	w.log.InfoContext(ctx, "embedding backfill started",
+		slog.Duration("interval", cfg.Interval),
+		slog.Int("batch_size", cfg.BatchSize),
+	)
+
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := w.backfillOnce(ctx, cfg.BatchSize); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				// Never fatal: the next sweep tries again. A backfill that killed the
+				// worker on a transient failure would take the live pipeline down with it.
+				w.log.WarnContext(ctx, "embedding backfill sweep failed; will retry",
+					slog.Any("error", err))
+			}
+		}
+	}
+}
+
+// backfillOnce embeds one batch of versions that are missing vectors.
+func (w *Worker) backfillOnce(ctx context.Context, batchSize int) error {
+	pending, err := w.pendingForBackfill(ctx, batchSize)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	w.log.InfoContext(ctx, "embedding backfill found versions to re-embed",
+		slog.Int("count", len(pending)),
+	)
+
+	var embedded, skipped int
+	for _, versionID := range pending {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		log := w.log.With(slog.String("cv_version_id", versionID.String()))
+		result, err := w.embedVersion(ctx, versionID, log)
+		if err != nil {
+			if apperr.KindOf(err) == apperr.KindDependency {
+				// Still down. Stop the sweep rather than hammering the provider once
+				// per pending version; the next sweep picks up where this left off.
+				w.log.WarnContext(ctx, "embedding still unavailable; ending this sweep",
+					slog.Int("embedded", embedded),
+					slog.Int("remaining", len(pending)-embedded-skipped),
+				)
+				return nil
+			}
+			// One unembeddable version must not stop the rest of the batch.
+			log.WarnContext(ctx, "backfill could not embed this version", slog.Any("error", err))
+			skipped++
+			continue
+		}
+		if result == nil {
+			skipped++
+			continue
+		}
+		embedded++
+
+		// Published so matching rescores what it had to score lexically. The envelope
+		// has no parent event — this is a recovery sweep, not a reaction to an upload.
+		w.publishNew(ctx, events.TypeCVEmbedded, map[string]any{
+			"version_id": versionID.String(),
+			"model":      result.Model,
+			"kinds":      result.Kinds,
+			"dims":       result.Dims,
+			"backfilled": true,
+		})
+	}
+
+	w.log.InfoContext(ctx, "embedding backfill sweep complete",
+		slog.Int("embedded", embedded),
+		slog.Int("skipped", skipped),
+	)
+	return nil
+}
+
+// pendingForBackfill picks the right recovery query for what the worker knows.
+//
+// Until an embedding has succeeded the worker does not know the provider's model name,
+// because the model is reported in a response rather than configured. On a cold start
+// it therefore asks for versions with no vectors at all, which is exactly the set an
+// outage leaves behind. Once the model is known it uses the model-scoped query, which
+// additionally catches versions left behind by a model upgrade.
+func (w *Worker) pendingForBackfill(ctx context.Context, batchSize int) ([]uuid.UUID, error) {
+	if model := w.currentModel(); model != "" {
+		return w.repo.VersionsNeedingEmbedding(ctx, model, batchSize)
+	}
+	return w.repo.VersionsWithoutAnyEmbedding(ctx, batchSize)
 }

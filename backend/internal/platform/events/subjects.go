@@ -30,6 +30,10 @@ const (
 	TypeCVAnalysisCompleted  = "cv.analysis_completed"
 	TypeCVTailoringRequested = "cv.tailoring_requested"
 	TypeCVTailored           = "cv.tailored"
+	// TypeCVEmbedded signals that a version now has vectors. Matching subscribes to
+	// rescore anything it had to score lexically while the embedding service was down,
+	// which is what stops a provider outage permanently degrading those matches.
+	TypeCVEmbedded = "cv.embedded"
 
 	// jobs
 	TypeDiscoveryRequested = "jobs.discovery.requested"

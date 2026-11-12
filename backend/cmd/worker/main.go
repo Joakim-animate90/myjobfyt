@@ -23,6 +23,7 @@ import (
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/ai"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/antivirus"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/docextract"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/embed"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/events"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/postgres"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/redisx"
@@ -86,11 +87,24 @@ func run() error {
 		return err
 	}
 
+	embedder, err := buildEmbedder(ctx, cfg, log)
+	if err != nil {
+		return err
+	}
+
 	log.Info("dependencies ready",
 		slog.String("scanner", scanner.Name()),
 		slog.String("bucket", cfg.Storage.Bucket),
 		slog.Bool("structured_extraction", extractor != nil),
+		slog.Bool("semantic_matching", embedder != nil),
 	)
+	if embedder == nil {
+		// Worth saying, because the symptom is subtler than an outright failure:
+		// matching still works but scores lexically, and every affected match is
+		// marked degraded until an embedding service appears.
+		log.Warn("no embedding service configured (EMBED_BASE_URL unset); " +
+			"matching will use the lexical fallback and mark matches degraded")
+	}
 	if extractor == nil {
 		// Said out loud, because the symptom otherwise is CVs that parse successfully
 		// and produce no matchable data, which looks like a matching bug.
@@ -105,6 +119,7 @@ func run() error {
 		Store:     objectStore,
 		Scanner:   scanner,
 		Extractor: extractor,
+		Embedder:  embedder,
 		Bus:       bus,
 		Logger:    log,
 		Limits: docextract.Limits{
@@ -140,6 +155,24 @@ func run() error {
 		return fmt.Errorf("start consumers: %w", err)
 	}
 
+	// The embedding backfill is what makes an embedding outage temporary. Without it
+	// a version the provider was down for would stay unembedded for good and the
+	// candidate would be permanently matched on the weaker lexical signal.
+	backfillDone := make(chan struct{})
+	if embedder != nil {
+		go func() {
+			defer close(backfillDone)
+			if err := cvWorker.RunEmbeddingBackfill(ctx, cv.EmbeddingBackfillConfig{
+				Interval:  cfg.Embed.BackfillInterval,
+				BatchSize: cfg.Embed.BackfillBatch,
+			}); err != nil {
+				log.Error("embedding backfill stopped", slog.Any("error", err))
+			}
+		}()
+	} else {
+		close(backfillDone)
+	}
+
 	metricsServer := startMetricsServer(cfg, log)
 
 	<-ctx.Done()
@@ -150,6 +183,10 @@ func run() error {
 	// Drain rather than stop, so in-flight handlers finish instead of having their
 	// work abandoned and redelivered. A rolling deploy should not re-do work.
 	runtime.Stop(cfg.Worker.ShutdownTO)
+
+	// The backfill observes the same cancelled context; wait so a sweep in progress
+	// finishes its current version rather than being abandoned mid-write.
+	<-backfillDone
 
 	if metricsServer != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -248,6 +285,38 @@ func buildExtractor(ctx context.Context, cfg *config.Config, db *postgres.DB, lo
 	return cv.NewAIExtractor(client, cv.ExtractorConfig{
 		PerCallTokenBudget: cfg.AI.ExtractionTokenBudget,
 	}), nil
+}
+
+// buildEmbedder constructs the embedding client, or nil when none is configured.
+//
+// Unlike the AI extractor, a missing embedder is acceptable even in production: the
+// lexical fallback is a designed path, not a degradation of last resort, and matching
+// works without it. What is not acceptable is an embedder that is configured and
+// broken, so a configured one is checked at boot.
+func buildEmbedder(ctx context.Context, cfg *config.Config, log *slog.Logger) (cv.Embedder, error) {
+	if cfg.Embed.BaseURL == "" {
+		return nil, nil
+	}
+
+	embedder := embed.NewHTTPEmbedder(embed.HTTPEmbedderConfig{
+		BaseURL:  cfg.Embed.BaseURL,
+		Timeout:  cfg.Embed.Timeout,
+		MaxBatch: cfg.Embed.MaxBatch,
+	})
+
+	// Ping embeds a real string rather than hitting a health endpoint, because a
+	// service can be listening and unable to load its model.
+	pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := embedder.Ping(pingCtx); err != nil {
+		return nil, fmt.Errorf("embedding service at %s is not responding: %w", cfg.Embed.BaseURL, err)
+	}
+
+	log.Info("semantic matching enabled",
+		slog.String("embedder", embedder.Name()),
+		slog.String("base_url", cfg.Embed.BaseURL),
+	)
+	return embedder, nil
 }
 
 // startMetricsServer exposes Prometheus metrics and a liveness endpoint.

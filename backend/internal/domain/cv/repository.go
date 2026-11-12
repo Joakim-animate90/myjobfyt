@@ -3,9 +3,11 @@ package cv
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/apperr"
+	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/embed"
 	"github.com/Joakim-animate90/myjobfyt/backend/internal/platform/postgres"
 	"github.com/google/uuid"
 )
@@ -42,6 +44,12 @@ type Repository interface {
 	RecordUnmatchedLabels(ctx context.Context, labels []NormalisedSkill) error
 	LinkSkillIDs(ctx context.Context, versionID uuid.UUID, resolved []NormalisedSkill) (int, error)
 	SkillLabelsForVersion(ctx context.Context, versionID uuid.UUID) ([]string, error)
+
+	StoreEmbeddings(ctx context.Context, embeddings []StoredEmbedding) error
+	EmbeddingsForVersion(ctx context.Context, userID, versionID uuid.UUID, model string) ([]StoredEmbedding, error)
+	VersionsNeedingEmbedding(ctx context.Context, model string, limit int) ([]uuid.UUID, error)
+	VersionsWithoutAnyEmbedding(ctx context.Context, limit int) ([]uuid.UUID, error)
+	EmbeddingInputs(ctx context.Context, versionID uuid.UUID) (EmbeddingInput, error)
 
 	SetLabel(ctx context.Context, userID, documentID uuid.UUID, label string) error
 	SetDefault(ctx context.Context, userID, documentID uuid.UUID) error
@@ -1052,4 +1060,240 @@ func (r *PostgresRepository) SkillLabelsForVersion(ctx context.Context, versionI
 		return nil, apperr.Internalf(err, "iterate skill labels")
 	}
 	return out, nil
+}
+
+// --- embeddings -------------------------------------------------------------
+
+// StoredEmbedding is a persisted vector.
+type StoredEmbedding struct {
+	CVVersionID uuid.UUID
+	Kind        embed.Kind
+	Model       string
+	Vector      embed.Vector
+}
+
+// StoreEmbeddings replaces a version's vectors for the models given.
+//
+// Keyed on (version, kind, model), so re-embedding with the same model overwrites and
+// re-embedding with a NEW model adds alongside. The old vectors are deliberately kept:
+// a comparison against a posting embedded by the old model still works until that
+// posting is re-embedded too, and deleting them first would leave a window where
+// nothing could be compared at all.
+func (r *PostgresRepository) StoreEmbeddings(ctx context.Context, embeddings []StoredEmbedding) error {
+	if len(embeddings) == 0 {
+		return nil
+	}
+
+	const q = `
+		INSERT INTO cv_embeddings (cv_version_id, kind, model, dims, vector)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (cv_version_id, kind, model) DO UPDATE
+		SET vector     = EXCLUDED.vector,
+		    dims       = EXCLUDED.dims,
+		    created_at = now()`
+
+	return r.db.InTx(ctx, func(ctx context.Context) error {
+		for _, e := range embeddings {
+			if !e.Kind.Valid() {
+				// The database CHECK would reject it; failing here names the kind.
+				return apperr.Internalf(
+					fmt.Errorf("embedding kind %q is not one of title, skills, summary, full", e.Kind),
+					"store embeddings")
+			}
+			if err := e.Vector.Validate(); err != nil {
+				return apperr.Internalf(err, "embedding for kind %q is unusable", e.Kind)
+			}
+
+			_, err := r.db.Querier(ctx).Exec(ctx, q,
+				e.CVVersionID, string(e.Kind), e.Model, e.Vector.Dims(), []float32(e.Vector))
+			if err != nil {
+				if postgres.IsForeignKeyViolation(err) {
+					// The version was deleted while embedding was in flight.
+					return apperr.NotFound("CV version")
+				}
+				return apperr.Internalf(err, "insert embedding for kind %q", e.Kind)
+			}
+		}
+		return nil
+	})
+}
+
+// EmbeddingsForVersion loads a version's vectors for a given model.
+//
+// Scoped by model rather than returning everything, because vectors from two models
+// are not comparable and a caller that mixed them would produce similarity scores that
+// look valid and mean nothing.
+func (r *PostgresRepository) EmbeddingsForVersion(ctx context.Context, userID, versionID uuid.UUID, model string) ([]StoredEmbedding, error) {
+	const q = `
+		SELECT e.kind, e.model, e.vector
+		FROM cv_embeddings e
+		JOIN cv_versions v ON v.id = e.cv_version_id
+		WHERE e.cv_version_id = $1 AND v.user_id = $2 AND e.model = $3
+		ORDER BY e.kind`
+
+	rows, err := r.db.Querier(ctx).Query(ctx, q, versionID, userID, model)
+	if err != nil {
+		return nil, apperr.Internalf(err, "list embeddings")
+	}
+	defer rows.Close()
+
+	var out []StoredEmbedding
+	for rows.Next() {
+		var (
+			kind   string
+			stored string
+			vector []float32
+		)
+		if err := rows.Scan(&kind, &stored, &vector); err != nil {
+			return nil, apperr.Internalf(err, "scan embedding")
+		}
+		out = append(out, StoredEmbedding{
+			CVVersionID: versionID,
+			Kind:        embed.Kind(kind),
+			Model:       stored,
+			Vector:      embed.Vector(vector),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internalf(err, "iterate embeddings")
+	}
+	return out, nil
+}
+
+// VersionsNeedingEmbedding returns parsed versions with no vectors for the given model.
+//
+// This is how matching recovers from an embedding outage. While the provider is down,
+// CVs still parse and still match — lexically, marked degraded. When it returns, this
+// query finds everything that was missed and the backfill re-embeds it, after which the
+// degraded matches are rescored. Nothing is lost, it is only temporarily less precise.
+//
+// Ordered oldest first so a backlog drains in the order it accumulated, and limited so
+// a backfill cannot monopolise the worker.
+func (r *PostgresRepository) VersionsNeedingEmbedding(ctx context.Context, model string, limit int) ([]uuid.UUID, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	const q = `
+		SELECT v.id
+		FROM cv_versions v
+		WHERE v.parse_status = 'parsed'
+		  AND v.av_status = 'clean'
+		  -- Must have structured data to embed from. A version parsed on extracted text
+		  -- alone has none, which is the normal state wherever the AI extractor is
+		  -- disabled. Without this clause every such version would sit in the recovery
+		  -- queue permanently and be re-examined by every sweep, for ever, because
+		  -- there is nothing the backfill could ever do about it.
+		  AND EXISTS (
+		    SELECT 1 FROM cv_parsed_data p WHERE p.cv_version_id = v.id
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM cv_embeddings e
+		    WHERE e.cv_version_id = v.id AND e.model = $1
+		  )
+		ORDER BY v.created_at
+		LIMIT $2`
+
+	rows, err := r.db.Querier(ctx).Query(ctx, q, model, limit)
+	if err != nil {
+		return nil, apperr.Internalf(err, "list versions needing embedding")
+	}
+	defer rows.Close()
+
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, apperr.Internalf(err, "scan version id")
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internalf(err, "iterate versions needing embedding")
+	}
+	return out, nil
+}
+
+// VersionsWithoutAnyEmbedding returns parsed versions that have no vectors at all,
+// under any model.
+//
+// The backfill's cold-start query. VersionsNeedingEmbedding needs a model name, but the
+// model is reported by the provider rather than configured, so after a restart the
+// worker does not yet know it — and the versions that matter most are precisely the
+// ones an outage left with nothing. Once a successful embedding has revealed the
+// current model, the backfill switches to the model-scoped query, which also catches a
+// model upgrade.
+func (r *PostgresRepository) VersionsWithoutAnyEmbedding(ctx context.Context, limit int) ([]uuid.UUID, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	const q = `
+		SELECT v.id
+		FROM cv_versions v
+		WHERE v.parse_status = 'parsed'
+		  AND v.av_status = 'clean'
+		  -- See VersionsNeedingEmbedding: a version with no structured data can never
+		  -- be embedded, so it must not be queued for recovery.
+		  AND EXISTS (
+		    SELECT 1 FROM cv_parsed_data p WHERE p.cv_version_id = v.id
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM cv_embeddings e WHERE e.cv_version_id = v.id
+		  )
+		ORDER BY v.created_at
+		LIMIT $1`
+
+	rows, err := r.db.Querier(ctx).Query(ctx, q, limit)
+	if err != nil {
+		return nil, apperr.Internalf(err, "list versions without embeddings")
+	}
+	defer rows.Close()
+
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, apperr.Internalf(err, "scan version id")
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internalf(err, "iterate versions without embeddings")
+	}
+	return out, nil
+}
+
+// EmbeddingInputs gathers the text a version's vectors are built from.
+//
+// Returns the focused extracts rather than the whole CV: an embedding model truncates
+// at a few hundred tokens, so embedding a full CV would capture only its opening and
+// the title vector would end up describing the candidate's address.
+func (r *PostgresRepository) EmbeddingInputs(ctx context.Context, versionID uuid.UUID) (EmbeddingInput, error) {
+	const q = `
+		SELECT coalesce(p.summary, ''),
+		       coalesce(p.contact->>'headline', ''),
+		       coalesce((p.experience->0->>'title'), ''),
+		       coalesce((
+		         SELECT string_agg(coalesce(s.canonical_name, cs.raw_label), ', '
+		                           ORDER BY coalesce(s.canonical_name, cs.raw_label))
+		         FROM cv_skills cs
+		         LEFT JOIN skills s ON s.id = cs.skill_id
+		         WHERE cs.cv_version_id = p.cv_version_id
+		       ), '')
+		FROM cv_parsed_data p
+		WHERE p.cv_version_id = $1`
+
+	var in EmbeddingInput
+	err := r.db.Querier(ctx).QueryRow(ctx, q, versionID).Scan(
+		&in.Summary, &in.Headline, &in.MostRecentTitle, &in.Skills,
+	)
+	if err != nil {
+		if postgres.IsNoRows(err) {
+			return EmbeddingInput{}, apperr.NotFound("parsed CV data")
+		}
+		return EmbeddingInput{}, apperr.Internalf(err, "gather embedding inputs")
+	}
+	in.CVVersionID = versionID
+	return in, nil
 }

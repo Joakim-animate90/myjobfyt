@@ -51,6 +51,7 @@ type Config struct {
 	Antivirus AntivirusConfig
 	Extract   ExtractConfig
 	AI        AIConfig
+	Embed     EmbedConfig
 	Telemetry TelemetryConfig
 	Worker    WorkerConfig
 }
@@ -183,6 +184,22 @@ type AIConfig struct {
 	ExtractionTokenBudget int64 `env:"AI_EXTRACTION_TOKEN_BUDGET" envDefault:"80000"`
 }
 
+type EmbedConfig struct {
+	// BaseURL points at a self-hosted embedding service. Empty leaves matching on the
+	// lexical fallback, which is a supported mode rather than a failure: the Claude API
+	// has no embeddings endpoint, so this component is always self-hosted and always
+	// allowed to be absent.
+	BaseURL  string        `env:"EMBED_BASE_URL"`
+	Timeout  time.Duration `env:"EMBED_TIMEOUT" envDefault:"30s"`
+	MaxBatch int           `env:"EMBED_MAX_BATCH" envDefault:"32"`
+	// BackfillInterval is how often the worker sweeps for versions left unembedded by
+	// an outage. A sweep is one indexed query when there is nothing to do.
+	BackfillInterval time.Duration `env:"EMBED_BACKFILL_INTERVAL" envDefault:"5m"`
+	// BackfillBatch bounds one sweep so a large backlog drains over several sweeps
+	// rather than starving live uploads.
+	BackfillBatch int `env:"EMBED_BACKFILL_BATCH" envDefault:"50"`
+}
+
 type AntivirusConfig struct {
 	// Addr is the clamd TCP address. Empty selects the development pass-through
 	// scanner, which production validation refuses.
@@ -269,6 +286,9 @@ func (c *Config) Validate() error {
 	}
 	if c.AI.Enabled && c.AI.ExtractionTokenBudget < 1000 {
 		problems = append(problems, "AI_EXTRACTION_TOKEN_BUDGET is implausibly small")
+	}
+	if c.Embed.MaxBatch < 1 {
+		problems = append(problems, "EMBED_MAX_BATCH must be at least 1")
 	}
 	if c.Extract.MaxPages < 1 {
 		problems = append(problems, "EXTRACT_MAX_PAGES must be at least 1")
