@@ -223,10 +223,17 @@ type CryptoConfig struct {
 }
 
 type TelemetryConfig struct {
-	OTLPEndpoint   string  `env:"OTEL_EXPORTER_OTLP_ENDPOINT"`
-	TraceSampleTat float64 `env:"OTEL_TRACES_SAMPLER_ARG" envDefault:"1.0"`
-	MetricsAddr    string  `env:"METRICS_ADDR" envDefault:":9090"`
-	Enabled        bool    `env:"TELEMETRY_ENABLED" envDefault:"true"`
+	// OTLPEndpoint is the collector's HTTP endpoint, host:port with no scheme (the
+	// exporter adds one). Empty means spans are not recorded at all.
+	OTLPEndpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT"`
+	// TraceSampleRatio is the fraction of root traces recorded. Child spans follow the
+	// parent's decision, so a sampled workflow is never recorded in part.
+	TraceSampleRatio float64 `env:"OTEL_TRACES_SAMPLER_ARG" envDefault:"1.0"`
+	// OTLPInsecure sends plaintext OTLP, which is right for a collector on localhost or
+	// inside a cluster and wrong across the internet.
+	OTLPInsecure bool   `env:"OTEL_EXPORTER_OTLP_INSECURE" envDefault:"true"`
+	MetricsAddr  string `env:"METRICS_ADDR" envDefault:":9090"`
+	Enabled      bool   `env:"TELEMETRY_ENABLED" envDefault:"true"`
 }
 
 type WorkerConfig struct {

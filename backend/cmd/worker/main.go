@@ -59,6 +59,31 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Installs the global tracer provider. Without it otel.Tracer() returns a no-op:
+	// every span is discarded and the event envelopes carry empty trace context, so
+	// the pipeline looks instrumented and records nothing.
+	shutdownTracing, err := telemetry.SetupTracing(ctx, telemetry.TracingOptions{
+		ServiceName:  cfg.ServiceName + "-worker",
+		Version:      cfg.Version,
+		Environment:  string(cfg.Env),
+		OTLPEndpoint: cfg.Telemetry.OTLPEndpoint,
+		SampleRatio:  cfg.Telemetry.TraceSampleRatio,
+		Insecure:     cfg.Telemetry.OTLPInsecure,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("set up tracing: %w", err)
+	}
+	defer func() {
+		// A fresh context: ctx is already cancelled by the time this runs, and a
+		// cancelled context exports nothing — losing exactly the spans from the
+		// shutdown someone is investigating.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Error("could not flush traces on shutdown", slog.Any("error", err))
+		}
+	}()
+
 	// --- dependencies -------------------------------------------------------
 
 	db, err := postgres.Open(ctx, cfg.Postgres)

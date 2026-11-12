@@ -9,3 +9,16 @@ datasources:
     type: loki
     access: proxy
     url: http://loki:3100
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # Lets a span jump to the logs for its trace. The pipeline is asynchronous, so
+      # reading one stage's logs in isolation rarely explains anything; the useful move
+      # is always "show me everything carrying this trace id".
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        filterByTraceID: true

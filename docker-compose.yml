@@ -147,6 +147,34 @@ services:
       - nats
     profiles: ["observability"]
 
+  otel-collector:
+    # 0.111.0 rather than a newer tag: the 0.116.0 image fails to exec its own binary
+    # on this host ("exec /otelcol-contrib: no such file or directory") despite a
+    # complete pull and a matching architecture.
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    command: ["--config=/etc/otel/config.yml"]
+    ports:
+      # OTLP HTTP, which is what the API and worker export to. Remapped like everything
+      # else in this file (default + 10000), so OTEL_EXPORTER_OTLP_ENDPOINT is
+      # localhost:14318 on the host.
+      - "14318:4318"
+      - "14317:4317"
+    volumes:
+      - ./deploy/observability/otel-collector.yml:/etc/otel/config.yml:ro
+    depends_on:
+      - tempo
+    profiles: ["observability"]
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo/config.yml"]
+    ports:
+      - "13200:3200"
+    volumes:
+      - ./deploy/observability/tempo.yml:/etc/tempo/config.yml:ro
+      - tempo_data:/var/tempo
+    profiles: ["observability"]
+
   grafana:
     image: grafana/grafana:11.4.0
     ports:
@@ -171,3 +199,4 @@ volumes:
   nats_data:
   minio_data:
   grafana_data:
+  tempo_data:

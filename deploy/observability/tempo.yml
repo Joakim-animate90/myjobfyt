@@ -1,0 +1,27 @@
+# Grafana Tempo, development configuration: single binary, local storage, no auth.
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  # Short, so a trace is queryable seconds after the pipeline runs rather than minutes.
+  # A production deployment would raise this considerably.
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 24h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks

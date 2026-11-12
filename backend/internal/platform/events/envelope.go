@@ -86,6 +86,17 @@ func (e *Envelope) DerivedMeta() Meta {
 		CorrelationID: e.CorrelationID,
 		CausationID:   e.EventID,
 		UserID:        e.UserID,
-		Trace:         e.Trace,
+		// Trace is deliberately left empty rather than copied from this envelope.
+		//
+		// The incoming headers name the span that published THIS event — for a CV, the
+		// HTTP request that accepted the upload. Copying them forward made every stage
+		// a direct child of that one span: the chain still shared a trace id, but it
+		// appeared as a flat fan of siblings under a span that had already ended, so
+		// the order of the pipeline and the time between stages were both invisible.
+		//
+		// PublishWithMeta fills this from the live context instead, where the active
+		// span is the consumer currently running. That keeps the trace id (the consumer
+		// extracted it from these very headers) while making each stage a child of the
+		// stage that caused it.
 	}
 }

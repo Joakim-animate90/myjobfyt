@@ -91,6 +91,13 @@ func (b *Bus) Publish(ctx context.Context, eventType string, version int, payloa
 // PublishWithMeta publishes an event with explicit envelope metadata. Handlers use
 // this with Envelope.DerivedMeta() so the correlation chain is carried forward.
 func (b *Bus) PublishWithMeta(ctx context.Context, eventType string, version int, meta Meta, payload any) error {
+	// Trace comes from the live context unless the caller supplied it. Inside a
+	// consumer the active span is that consumer, so the published event becomes a
+	// child of the stage that caused it rather than a sibling of it.
+	if len(meta.Trace) == 0 {
+		meta.Trace = traceHeadersFromContext(ctx)
+	}
+
 	env, err := NewEnvelope(eventType, version, meta, payload)
 	if err != nil {
 		return err

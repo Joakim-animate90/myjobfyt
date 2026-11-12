@@ -148,8 +148,13 @@ func TestDerivedMetaAdvancesTheCausationChain(t *testing.T) {
 	if meta.UserID != "user-7" {
 		t.Errorf("UserID = %q, want user-7", meta.UserID)
 	}
-	if meta.Trace["traceparent"] != "00-abc-def-01" {
-		t.Errorf("trace context was dropped: %+v", meta.Trace)
+	// Trace is deliberately NOT carried forward here. The parent's headers name the
+	// span that published the parent event, so copying them would make every stage a
+	// sibling under that one span instead of a chain. PublishWithMeta fills Trace from
+	// the live context, where the active span is the consumer currently running — see
+	// TestAChainOfStagesNestsRatherThanFlattening.
+	if len(meta.Trace) != 0 {
+		t.Errorf("DerivedMeta carried the parent's trace forward: %+v", meta.Trace)
 	}
 }
 

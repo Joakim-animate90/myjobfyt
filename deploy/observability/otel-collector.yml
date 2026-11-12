@@ -1,0 +1,44 @@
+# OpenTelemetry Collector for development.
+#
+# The services export OTLP here rather than straight to Tempo, which is how the
+# production topology works too: swapping a trace backend then means changing one
+# exporter in this file instead of reconfiguring and redeploying every service.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Bounds memory so a trace spike cannot push the collector into the OOM killer and
+  # take the pipeline's observability down exactly when it is needed.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  # Keeps the span count visible in `docker compose logs otel-collector`, which is the
+  # quickest way to tell "nothing is being exported" from "nothing is being recorded".
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      # memory_limiter first: it has to be able to reject before anything is buffered.
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, debug]
+  telemetry:
+    logs:
+      level: info
