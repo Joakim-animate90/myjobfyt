@@ -51,6 +51,7 @@ type Repository interface {
 	VersionsWithoutAnyEmbedding(ctx context.Context, limit int) ([]uuid.UUID, error)
 	CandidateEmail(ctx context.Context, userID uuid.UUID) (string, error)
 	StoreTailoredVersion(ctx context.Context, v *Version, parsed *ParsedData, skills []Skill) error
+	RawTextForVersion(ctx context.Context, userID, versionID uuid.UUID) (string, error)
 	EmbeddingInputs(ctx context.Context, versionID uuid.UUID) (EmbeddingInput, error)
 
 	SetLabel(ctx context.Context, userID, documentID uuid.UUID, label string) error
@@ -914,6 +915,25 @@ func (r *PostgresRepository) RecordCorrection(ctx context.Context, userID, versi
 		return apperr.NotFound("parsed CV data")
 	}
 	return nil
+}
+
+// RawTextForVersion loads a version's extracted text for a candidate-facing read.
+//
+// Separate from RawText, which is deliberately unscoped for the worker. Every path a
+// candidate can reach is scoped by user_id in the query itself rather than relying on
+// an ownership check made earlier by a caller, because that check is one refactor away
+// from being dropped.
+func (r *PostgresRepository) RawTextForVersion(ctx context.Context, userID, versionID uuid.UUID) (string, error) {
+	const q = `SELECT coalesce(raw_text, '') FROM cv_versions WHERE id = $1 AND user_id = $2`
+
+	var text string
+	if err := r.db.Querier(ctx).QueryRow(ctx, q, versionID, userID).Scan(&text); err != nil {
+		if postgres.IsNoRows(err) {
+			return "", apperr.NotFound("CV version")
+		}
+		return "", apperr.Internalf(err, "select cv raw text")
+	}
+	return text, nil
 }
 
 // RawText loads a version's extracted text for the structure stage.

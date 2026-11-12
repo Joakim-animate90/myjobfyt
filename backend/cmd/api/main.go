@@ -169,11 +169,16 @@ func run() error {
 	// Tailoring is the only CV feature that needs the AI provider on the request path.
 	// A nil service disables its route rather than failing the whole API, so every
 	// other CV operation keeps working without credentials.
-	tailoringService, err := buildTailoringService(ctx, cfg, db, log)
+	aiClient, err := buildAIClient(ctx, cfg, db, redis, log)
 	if err != nil {
 		return err
 	}
+	tailoringService := buildTailoringService(aiClient, db, redis, log)
 	tailoringHandler := cv.NewTailoringHandler(tailoringService, log)
+
+	// The checker always works: the deterministic rubric needs no provider, and the
+	// report states which categories the model pass would have supplied.
+	checkHandler := cv.NewCheckHandler(buildCheckService(aiClient, cfg, db, redis, log), log)
 	if tailoringService == nil {
 		log.Warn("CV tailoring is DISABLED (AI_ENABLED=false); the tailor endpoint will refuse requests")
 	}
@@ -206,6 +211,7 @@ func run() error {
 			})
 			cvHandler.RegisterRoutes(r, requireAuth)
 			tailoringHandler.RegisterRoutes(r, requireAuth)
+			checkHandler.RegisterRoutes(r, requireAuth)
 		},
 	})
 
@@ -318,12 +324,13 @@ func startMetricsServer(cfg *config.Config, log *slog.Logger) *http.Server {
 	return srv
 }
 
-// buildTailoringService constructs the CV tailoring service, or nil when AI is off.
+// buildAIClient constructs the shared AI client, or nil when AI is off.
 //
-// Mirrors the worker's buildExtractor: the provider is pinged at boot rather than on
-// the first request, because an API that starts healthy and then fails every tailoring
-// attempt is far harder to diagnose than one that says so at startup.
-func buildTailoringService(ctx context.Context, cfg *config.Config, db *postgres.DB, log *slog.Logger) (*cv.TailoringService, error) {
+// One client for every request-path AI feature, so quota accounting, retries and cost
+// attribution are configured once. The provider is pinged at boot rather than on the
+// first request: an API that starts healthy and then fails every AI call is far harder
+// to diagnose than one that says so at startup.
+func buildAIClient(ctx context.Context, cfg *config.Config, db *postgres.DB, redis *redisx.Client, log *slog.Logger) (*ai.Client, error) {
 	if !cfg.AI.Enabled {
 		if cfg.Env.IsProduction() {
 			return nil, errors.New("AI_ENABLED must be true in production")
@@ -343,28 +350,48 @@ func buildTailoringService(ctx context.Context, cfg *config.Config, db *postgres
 		return nil, fmt.Errorf("ai provider is not reachable: %w", err)
 	}
 
-	redis, err := redisx.Open(ctx, cfg.Redis)
-	if err != nil {
-		return nil, fmt.Errorf("redis (needed for AI token quotas): %w", err)
-	}
-
 	accountant := entitlements.NewTokenAccountant(
 		entitlements.NewService(entitlements.NewPostgresRepository(db), redis, log, nil),
 		log,
 	)
 
-	client := ai.NewClient(ai.ClientDeps{
+	log.Info("AI features enabled", slog.String("provider", provider.Name()))
+
+	return ai.NewClient(ai.ClientDeps{
 		Provider:   provider,
 		Accountant: accountant,
 		Logger:     log,
-	})
+	}), nil
+}
 
-	log.Info("CV tailoring enabled", slog.String("provider", provider.Name()))
-
+// buildTailoringService constructs the CV tailoring service, or nil when AI is off.
+func buildTailoringService(client *ai.Client, db *postgres.DB, redis *redisx.Client, log *slog.Logger) *cv.TailoringService {
+	if client == nil {
+		return nil
+	}
 	return cv.NewTailoringService(
 		cv.NewPostgresRepository(db),
 		cv.NewAITailorer(client, cv.TailorerConfig{}),
 		cv.NewRedisProposalStore(redis),
 		log,
-	), nil
+	)
+}
+
+// buildCheckService constructs the CV checker.
+//
+// Always returned, with or without AI: the deterministic rubric produces a score on its
+// own, and a nil analyser simply leaves the report declaring keyword coverage missing.
+// This is the one AI-adjacent feature that must never be unavailable, because it is the
+// free-tier entry point.
+func buildCheckService(client *ai.Client, cfg *config.Config, db *postgres.DB, redis *redisx.Client, log *slog.Logger) *cv.CheckService {
+	var analyser cv.CheckAnalyser
+	if client != nil {
+		analyser = cv.NewAICheckAnalyser(client, cfg.AI.ExtractionTokenBudget)
+	}
+	return cv.NewCheckService(
+		cv.NewPostgresRepository(db),
+		analyser,
+		cv.NewRedisCheckCache(redis),
+		log,
+	)
 }
